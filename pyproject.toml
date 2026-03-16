@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ridesharing-gym"
+dynamic = ["version"]
+description = "A customizable multi-agent ride-sharing simulation environment compatible with Gym"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+keywords = ["reinforcement-learning", "multi-agent", "ride-sharing", "gym", "benchmark"]
+authors = [
+  { name = "Zijian Zhao", email = "zzhaock@connect.ust.hk" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/RS2002/RideSharing_Gym"
+Repository = "https://github.com/RS2002/RideSharing_Gym.git"
+"Bug Tracker" = "https://github.com/RS2002/RideSharing_Gym/issues"
+Documentation = "https://ridesharing-gym.readthedocs.io/"   # 如果有 sphinx
+
+[tool.hatch.version]
+path = "src/ridesharing_gym/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ridesharing_gym"]
