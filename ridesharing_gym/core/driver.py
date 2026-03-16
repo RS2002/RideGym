@@ -127,21 +127,16 @@ class Driver:
         """
         Move the driver for a given time step.
 
-        If the distance calculator supports network-based movement (i.e., has a
-        `get_path_between` method), the driver will move along the road network.
-        Otherwise, it moves in a straight line.
+        If the distance calculator supports network-based movement (i.e., its
+        `get_path_between` method returns a non-None path), the driver will move
+        along the road network. Otherwise, it moves in a straight line.
 
         Args:
             time_step: Duration of movement in seconds.
-            distance_calc: Distance calculator with optional network capabilities.
+            distance_calc: Distance calculator.
 
         Returns:
             List of events that occurred during this move.
-            Each event is a tuple (event_type, order_id, location, time_offset) where:
-                - event_type: 'pickup', 'dropoff', or 'reposition_arrived'
-                - order_id: associated order ID (None for reposition)
-                - location: coordinates where the event occurred
-                - time_offset: time from the start of the step when the event occurred (seconds)
         """
         if self.status == DriverStatus.IDLE or not self.route:
             return []
@@ -151,24 +146,15 @@ class Driver:
         remaining_distance = distance_to_travel
         time_elapsed = 0.0
 
-        use_network = hasattr(distance_calc, 'get_path_between')
-
         while remaining_distance > 1e-6 and self.route:
-            if use_network:
-                # Network movement
-                if not self.node_path or self.path_index >= len(self.node_path):
-                    # Compute path from current location to the next waypoint
-                    next_wp = self.route[0]
-                    path = distance_calc.get_path_between(self.current_location, next_wp.location)
-                    if path is None or len(path) == 0:
-                        # No path found; cannot proceed
-                        break
-
+            # Check if network movement is available and we need a new path
+            if hasattr(distance_calc, 'get_path_between') and (not self.node_path or self.path_index >= len(self.node_path)):
+                next_wp = self.route[0]
+                path = distance_calc.get_path_between(self.current_location, next_wp.location)
+                if path is not None and len(path) > 0:
                     if len(path) == 1:
-                        # Start and end nodes are the same; we are already at the destination node.
-                        # Trigger immediate arrival.
+                        # Already at destination
                         wp = self.route.pop(0)
-                        # Event occurs at current time (time_elapsed remains unchanged)
                         event_time = time_elapsed
                         if wp.waypoint_type == WaypointType.PICKUP:
                             events.append(('pickup', wp.order_id, wp.location, event_time))
@@ -176,23 +162,29 @@ class Driver:
                             events.append(('dropoff', wp.order_id, wp.location, event_time))
                         elif wp.waypoint_type == WaypointType.REPOSITION:
                             events.append(('reposition_arrived', None, wp.location, event_time))
-                        # Clear node path for next segment
-                        self.node_path = []
-                        self.path_index = 0
-                        continue  # proceed to next waypoint or continue loop
+                        continue
 
-                    # Normal case: path has at least two nodes
                     self.node_path = path
-                    self.path_index = 1  # skip the starting node (current location is already at or near it)
+                    self.path_index = 1  # skip current node
                     self.current_node = path[0]
 
-                # Move along the current node path
+            # Now decide whether to use network or straight-line
+            if self.node_path and self.path_index < len(self.node_path):
+                # Network movement along current node path
                 target_node = self.node_path[self.path_index]
                 target_loc = distance_calc.node_location(target_node)
-                dist_to_target = distance_calc.distance(self.current_location, target_loc)
+
+                # Get distance to target using edge length if available
+                if hasattr(distance_calc, 'edge_length'):
+                    try:
+                        dist_to_target = distance_calc.edge_length(self.current_node, target_node)
+                    except ValueError:
+                        # Fallback to Euclidean between nodes
+                        dist_to_target = distance_calc.distance(self.current_location, target_loc)
+                else:
+                    dist_to_target = distance_calc.distance(self.current_location, target_loc)
 
                 if dist_to_target <= remaining_distance:
-                    # Can reach the target node
                     travel_time = dist_to_target / self.speed
                     time_elapsed += travel_time
                     remaining_distance -= dist_to_target
@@ -201,22 +193,19 @@ class Driver:
                     self.total_distance_driven += dist_to_target
                     self.path_index += 1
 
-                    # Check if we have reached the end of the path (i.e., the waypoint)
                     if self.path_index >= len(self.node_path):
-                        # Reached the waypoint
+                        # Reached the waypoint at the end of this path
                         wp = self.route.pop(0)
-                        event_time = time_elapsed  # time since start of step when arrival occurred
+                        event_time = time_elapsed
                         if wp.waypoint_type == WaypointType.PICKUP:
                             events.append(('pickup', wp.order_id, wp.location, event_time))
                         elif wp.waypoint_type == WaypointType.DROPOFF:
                             events.append(('dropoff', wp.order_id, wp.location, event_time))
                         elif wp.waypoint_type == WaypointType.REPOSITION:
                             events.append(('reposition_arrived', None, wp.location, event_time))
-                        # Clear node path for next segment
                         self.node_path = []
                         self.path_index = 0
                 else:
-                    # Cannot reach the target node; move partway
                     travel_time = remaining_distance / self.speed
                     time_elapsed += travel_time
                     ratio = remaining_distance / dist_to_target
@@ -226,23 +215,20 @@ class Driver:
                     self.total_distance_driven += remaining_distance
                     remaining_distance = 0
             else:
-                # Straight-line movement (original logic with precise time offsets)
+                # Straight-line movement
                 next_wp = self.route[0]
                 dist_to_next = distance_calc.distance(self.current_location, next_wp.location)
 
                 if dist_to_next <= remaining_distance:
-                    # Can reach the next waypoint
                     travel_time = dist_to_next / self.speed
                     time_elapsed += travel_time
                     remaining_distance -= dist_to_next
                     self.current_location = next_wp.location
                     self.total_distance_driven += dist_to_next
                     self.route.pop(0)
-                    # Event occurs at the moment of arrival
                     event_time = time_elapsed
                     events.append((next_wp.waypoint_type.value, next_wp.order_id, next_wp.location, event_time))
                 else:
-                    # Cannot reach the next waypoint; move partway
                     travel_time = remaining_distance / self.speed
                     time_elapsed += travel_time
                     ratio = remaining_distance / dist_to_next

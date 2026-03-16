@@ -2,8 +2,11 @@
 Real road network distance calculator using OSMnx with path matrix and real-time path queries.
 """
 
+import os
+import hashlib
+import pickle
 import logging
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Any
 
 import numpy as np
 import networkx as nx
@@ -33,6 +36,7 @@ class OSMnxDistance(DistanceCalculator):
 
     Precomputes distance and path matrices between zone centers for efficiency.
     Supports real-time path queries for arbitrary points via nearest zone centers.
+    Matrices are cached to disk to avoid recomputation.
 
     Args:
         place_name: OSMnx place query (e.g., "Manhattan, New York, USA").
@@ -56,29 +60,50 @@ class OSMnxDistance(DistanceCalculator):
                 "Install with: pip install osmnx networkx"
             )
 
+        self.place_name = place_name
         self.zone_centers = zone_centers
+        self.network_type = network_type
         self.show_progress = show_progress
 
-        # Configure caching if requested
-        if cache_dir is not None:
-            ox.settings.cache_folder = cache_dir
-            ox.settings.use_cache = True
+        # Set up caching directory
+        if cache_dir is None:
+            cache_dir = os.path.join(os.getcwd(), "osmnx_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        ox.settings.cache_folder = cache_dir
+        ox.settings.use_cache = True
 
-        # Download and project the graph
-        logger.info(f"Downloading OSM graph for {place_name}...")
-        self.graph = ox.graph_from_place(place_name, network_type=network_type)
-        self.graph = ox.project_graph(self.graph)  # Project to UTM for accurate distances
-        logger.info("Graph downloaded and projected.")
+        # Generate a unique cache key based on parameters
+        zone_hash = hashlib.md5(str(zone_centers).encode()).hexdigest()
+        cache_key = f"{place_name}_{network_type}_{zone_hash}"
+        matrix_file = os.path.join(cache_dir, f"{cache_key}_matrix.pkl")
 
-        # Find nearest graph nodes for each zone center
-        lons = [p[1] for p in zone_centers]
-        lats = [p[0] for p in zone_centers]
-        self.zone_nodes = ox.nearest_nodes(self.graph, lons, lats)
+        # Try to load cached matrices
+        if os.path.exists(matrix_file):
+            logger.info(f"Loading cached matrices from {matrix_file}")
+            with open(matrix_file, 'rb') as f:
+                self.dist_matrix, self.path_matrix = pickle.load(f)
+            # Need graph for node locations and real-time paths
+            self.graph = ox.graph_from_place(place_name, network_type=network_type)
+        else:
+            # Download graph
+            logger.info(f"Downloading OSM graph for {place_name}...")
+            self.graph = ox.graph_from_place(place_name, network_type=network_type)
+            logger.info("Graph downloaded.")
 
-        # Precompute distance and path matrices between zone centers
-        logger.info("Computing distance and path matrices...")
-        self.dist_matrix, self.path_matrix = self._compute_matrices(self.zone_nodes)
-        logger.info("Matrices computed.")
+            # Find nearest graph nodes for each zone center
+            lons = [p[1] for p in zone_centers]
+            lats = [p[0] for p in zone_centers]
+            self.zone_nodes = ox.nearest_nodes(self.graph, lons, lats)
+
+            # Compute matrices
+            logger.info("Computing distance and path matrices...")
+            self.dist_matrix, self.path_matrix = self._compute_matrices(self.zone_nodes)
+            logger.info("Matrices computed.")
+
+            # Save to cache
+            with open(matrix_file, 'wb') as f:
+                pickle.dump((self.dist_matrix, self.path_matrix), f)
+            logger.info(f"Matrices saved to {matrix_file}")
 
         # Build spatial index for fast nearest zone lookup
         self.spatial_index = SpatialIndex(zone_centers)
@@ -158,9 +183,7 @@ class OSMnxDistance(DistanceCalculator):
         """
         node1 = ox.nearest_nodes(self.graph, point1[1], point1[0])  # (lon, lat)
         node2 = ox.nearest_nodes(self.graph, point2[1], point2[0])
-
         if node1 == node2:
-            # Start and end at the same node; path consists of that node only
             return [node1]
 
         try:
@@ -181,6 +204,34 @@ class OSMnxDistance(DistanceCalculator):
         """
         node_data = self.graph.nodes[node_id]
         return (node_data['y'], node_data['x'])
+
+    def edge_length(self, u: int, v: int) -> float:
+        """
+        Return the length of the shortest edge between nodes u and v.
+
+        Args:
+            u: First node ID.
+            v: Second node ID.
+
+        Returns:
+            Edge length in meters.
+
+        Raises:
+            ValueError: If no edge exists between u and v.
+        """
+        edge_data = self.graph.get_edge_data(u, v)
+        if edge_data is None:
+            # Try reverse direction
+            edge_data = self.graph.get_edge_data(v, u)
+        if edge_data is None:
+            raise ValueError(f"No edge between nodes {u} and {v}")
+
+        # edge_data may be a dict of parallel edges (keys 0,1,...)
+        if isinstance(edge_data, dict):
+            lengths = [data['length'] for data in edge_data.values()]
+            return min(lengths)
+        else:
+            return edge_data['length']
 
     def _nearest_zone(self, point: Tuple[float, float]) -> int:
         """

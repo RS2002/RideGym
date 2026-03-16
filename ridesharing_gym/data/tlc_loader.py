@@ -1,8 +1,10 @@
 """
-TLC Trip Record Data loader supporting CSV and Parquet formats with LocationID mode and date/hour filtering.
+TLC Trip Record Data loader supporting CSV and Parquet formats with LocationID mode,
+date/hour filtering, and request time rounding to simulation step boundaries.
 """
 
 import os
+import math
 import pandas as pd
 import numpy as np
 from typing import List, Optional, Dict, Tuple
@@ -28,8 +30,11 @@ class TLCDataLoader(DataLoader):
                      default zones are loaded automatically.
         date_filter: Optional date string (e.g., "2025-11-15") to filter orders for a specific day.
                      If None, all orders are used.
-        hour_range: Optional tuple (start_hour, end_hour) to filter orders within a hour range (inclusive start, exclusive end).
-                    e.g., (8,20) for 8:00 to 19:59.
+        hour_range: Optional tuple (start_hour, end_hour) to filter orders within a hour range
+                    (inclusive start, exclusive end). e.g., (8,20) for 8:00 to 19:59.
+        step_duration: Duration of each simulation step in seconds. If provided, request times
+                       are rounded to multiples of step_duration.
+        rounding_mode: Rounding mode for request times: 'floor', 'ceil', or 'round'. Default 'floor'.
         request_time_column: Column name for pickup time.
         passenger_count_column: Column name for passenger count.
         pickup_location_id_column: Column name for pickup location ID (if use_location_id=True).
@@ -51,6 +56,8 @@ class TLCDataLoader(DataLoader):
         zone_coords: Optional[Dict[int, Tuple[float, float]]] = None,
         date_filter: Optional[str] = None,
         hour_range: Optional[Tuple[int, int]] = None,
+        step_duration: Optional[float] = None,
+        rounding_mode: str = 'floor',
         request_time_column: str = 'tpep_pickup_datetime',
         passenger_count_column: str = 'passenger_count',
         pickup_location_id_column: str = 'PULocationID',
@@ -67,6 +74,8 @@ class TLCDataLoader(DataLoader):
         self.use_location_id = use_location_id
         self.date_filter = date_filter
         self.hour_range = hour_range
+        self.step_duration = step_duration
+        self.rounding_mode = rounding_mode
         self.request_col = request_time_column
         self.passenger_col = passenger_count_column
         self.pickup_loc_id_col = pickup_location_id_column
@@ -140,6 +149,18 @@ class TLCDataLoader(DataLoader):
             self.start_time_shift = start_time_shift
 
         self.df['shifted_time'] = self.df['timestamp'] - self.start_time_shift
+
+        # Apply rounding to step boundaries if step_duration is provided
+        if self.step_duration is not None and self.step_duration > 0:
+            if rounding_mode == 'floor':
+                self.df['shifted_time'] = np.floor(self.df['shifted_time'] / self.step_duration) * self.step_duration
+            elif rounding_mode == 'ceil':
+                self.df['shifted_time'] = np.ceil(self.df['shifted_time'] / self.step_duration) * self.step_duration
+            elif rounding_mode == 'round':
+                self.df['shifted_time'] = np.round(self.df['shifted_time'] / self.step_duration) * self.step_duration
+            else:
+                raise ValueError(f"Invalid rounding_mode: {rounding_mode}. Choose from 'floor', 'ceil', 'round'.")
+
         self._total_duration = float(self.df['shifted_time'].max())
 
         # Debug print
@@ -170,10 +191,21 @@ class TLCDataLoader(DataLoader):
             if self.cancel_time_delta is not None:
                 cancel = row['shifted_time'] + self.cancel_time_delta
 
+            # Skip orders with same pickup and dropoff location ID
+            if self.use_location_id:
+                pu_id = row[self.pickup_loc_id_col]
+                do_id = row[self.dropoff_loc_id_col]
+                if pu_id == do_id:
+                    continue
+
             try:
                 pu, do = self._get_coordinates(row)
             except KeyError:
                 continue  # skip orders with missing zone mapping
+
+            # For non-ID mode, skip if coordinates are identical (optional)
+            if not self.use_location_id and pu == do:
+                continue
 
             order = Order(
                 order_id=int(idx),
