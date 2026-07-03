@@ -34,6 +34,7 @@ def match_drivers_to_orders(
     q_real: np.ndarray,
     q_dummy: np.ndarray,
     legal_mask: np.ndarray,
+    allow_idle: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Solve the augmented assignment problem.
 
@@ -46,6 +47,25 @@ def match_drivers_to_orders(
     legal_mask:
         ``[N, M]`` boolean; ``True`` where (driver, order) is a legal,
         in-candidate pair. Illegal entries are forced to ``-INF``.
+    allow_idle:
+        Whether a driver may *actively* choose its dummy (take-no-order)
+        action when a legal real order is available.
+
+        * ``True`` (default): the dummy competes on its own Q-value, so a
+          driver takes no order whenever its dummy Q exceeds every legal
+          real-order Q -- the agent can decide that staying idle is best.
+        * ``False``: idling is only a PASSIVE fallback. Every dummy column is
+          pushed far below any legal real-order Q, so the matching first
+          maximises the number of real-order assignments (Q breaks ties) and a
+          driver lands on its dummy ONLY when no legal real order can be
+          assigned to it (all taken by others, or none in-candidate / within
+          capacity). This prevents the policy from learning to refuse demand
+          (which inflates the empty/idle rate).
+
+        Either way the dummy stays finite and feasible, so the matching is
+        always solvable, and ``chosen_q`` for an idled driver is always its
+        TRUE ``q_dummy`` value (the penalty affects selection only, never the
+        reported Q), keeping TD targets correct.
 
     Returns
     -------
@@ -67,7 +87,28 @@ def match_drivers_to_orders(
 
     # Right block: per-driver private dummy column (diagonal).
     rows = np.arange(n)
-    aug[rows, m + rows] = q_dummy
+    if allow_idle:
+        # Active idling: the dummy competes on its real Q-value.
+        aug[rows, m + rows] = q_dummy
+    else:
+        # Passive-only idling: drop every dummy column far below any legal
+        # real-order Q so the LP maximises the number of real assignments
+        # first (a driver idles only when it has no assignable legal order).
+        # The offset must dominate the entire spread of real Q-values across
+        # all N possible re-assignments, so swapping a driver onto ANY real
+        # order always beats leaving it idle. Computed from the legal real
+        # entries only; if there are none, the dummy value is irrelevant to
+        # the ranking and we leave it at q_dummy.
+        legal_real = (
+            aug[:, :m][aug[:, :m] > NEG_INF / 2] if m > 0 else np.empty(0)
+        )
+        if legal_real.size > 0:
+            real_min = float(legal_real.min())
+            spread = float(legal_real.max()) - real_min
+            penalty_base = real_min - (spread + 1.0) * max(n, 1)
+            aug[rows, m + rows] = penalty_base
+        else:
+            aug[rows, m + rows] = q_dummy
 
     # Maximise total Q  ->  minimise -Q.
     row_ind, col_ind = linear_sum_assignment(-aug)

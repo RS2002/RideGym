@@ -93,7 +93,11 @@ class Driver:
     location:
         Current continuous coordinate.
     capacity:
-        Maximum simultaneous onboard passengers.
+        Maximum simultaneous onboard passengers (per-vehicle, may differ
+        across the fleet).
+    speed:
+        Per-vehicle travel speed (distance units / minute). ``None`` inherits
+        the road network's default speed (homogeneous fleet).
     status:
         Current task status (see :class:`DriverStatus`).
     onboard_passengers:
@@ -114,6 +118,12 @@ class Driver:
     driver_id: int
     location: Coord
     capacity: int = 4
+    # Per-driver travel speed (distance units per minute). ``None`` means the
+    # driver inherits the road network's default speed, preserving the original
+    # homogeneous-fleet behaviour. A positive value lets a heterogeneous fleet
+    # have per-vehicle speeds; the movement model uses this in place of
+    # ``network.speed`` when set.
+    speed: Optional[float] = None
 
     status: DriverStatus = DriverStatus.IDLE
     onboard_passengers: int = 0

@@ -55,6 +55,8 @@ class RidePoolEnv:
         area: Area = (0.0, 0.0, 100.0, 100.0),
         num_drivers: int = 10,
         driver_capacity: int = 4,
+        driver_capacities: Optional[List[int]] = None,
+        driver_speeds: Optional[List[float]] = None,
         dt: float = 1.0,
         horizon: float = 240.0,
         order_timeout: Optional[float] = 10.0,
@@ -64,6 +66,9 @@ class RidePoolEnv:
         reward_function: Optional[RewardFunction] = None,
         relocation_points: Optional[List[Coord]] = None,
         relocation_grid: Tuple[int, int] = (5, 5),
+        relocation_centroids: Optional[List[Coord]] = None,
+        relocation_adjacency: int = 8,
+        relocation_neighbours_k: int = 8,
         seed: Optional[int] = None,
     ):
         """Configure the environment.
@@ -75,7 +80,18 @@ class RidePoolEnv:
         num_drivers:
             Number of driver agents.
         driver_capacity:
-            Per-driver passenger capacity.
+            Default per-driver passenger capacity, applied to every vehicle when
+            ``driver_capacities`` is not given (homogeneous fleet).
+        driver_capacities:
+            Optional explicit per-vehicle capacities, length ``num_drivers``
+            (vehicle ``i`` gets ``driver_capacities[i]``). When given it
+            overrides ``driver_capacity`` and enables a heterogeneous fleet.
+        driver_speeds:
+            Optional explicit per-vehicle travel speeds (distance units /
+            minute), length ``num_drivers``. ``None`` (default) makes every
+            vehicle inherit the road network's default speed (homogeneous
+            fleet); a per-vehicle value is used in place of ``network.speed``
+            in the movement model.
         dt:
             Time-step length in minutes.
         horizon:
@@ -92,16 +108,58 @@ class RidePoolEnv:
         reward_function:
             Per-driver reward. Defaults to :class:`DefaultRewardFunction`.
         relocation_points:
-            Preset relocation coordinates. If ``None`` an evenly spaced grid of
-            ``relocation_grid`` cell centres is generated.
+            Preset relocation coordinates. If ``None`` they are derived from
+            ``relocation_centroids`` (if given) or an evenly spaced grid of
+            ``relocation_grid`` cell centres. These are the *region centres*;
+            each is a selectable relocation target and defines one region.
         relocation_grid:
-            ``(rows, cols)`` for the auto-generated relocation grid.
+            ``(rows, cols)`` for the auto-generated uniform-grid region model.
+            Used only when neither ``relocation_points`` nor
+            ``relocation_centroids`` is supplied. The grid model supports
+            geometric N-adjacency (see ``relocation_adjacency``).
+        relocation_centroids:
+            User-supplied region centres ``[(x, y), ...]`` (e.g. NYC taxi-zone
+            centroids). When given, the region model is the (generally
+            irregular) set of these centres and region adjacency degenerates to
+            the K spatially-nearest centres (see ``relocation_neighbours_k``),
+            since N-gon adjacency has no meaning for an irregular point set.
+        relocation_adjacency:
+            Number of geometric neighbours per region in the *grid* model: 4
+            (von Neumann: up/down/left/right) or 8 (Moore: incl. diagonals).
+            Ignored for the centroid model.
+        relocation_neighbours_k:
+            Number of spatially-nearest neighbour regions per region in the
+            *centroid* model. Ignored for the grid model.
         seed:
             Base RNG seed for reproducibility.
+
+        Region model / single source of truth
+        --------------------------------------
+        The environment owns the region partition AND the region-adjacency
+        graph, exposing both via observations (``self.current_region`` and the
+        shared ``region_neighbours``) so that any policy reuses *exactly* the
+        same regions/adjacency the env will enforce -- there is no second,
+        possibly-inconsistent definition on the policy side.
         """
         self.area = area
         self.num_drivers = int(num_drivers)
         self.driver_capacity = int(driver_capacity)
+        # Resolve per-vehicle capacities / speeds into length-num_drivers lists
+        # once at construction. Capacities default to the homogeneous
+        # ``driver_capacity``; speeds default to ``None`` per vehicle (inherit
+        # the network speed). Explicit lists must match ``num_drivers``.
+        self.driver_capacities: List[int] = self._resolve_per_driver(
+            driver_capacities,
+            default=self.driver_capacity,
+            name="driver_capacities",
+            cast=int,
+        )
+        self.driver_speeds: List[Optional[float]] = self._resolve_per_driver(
+            driver_speeds,
+            default=None,
+            name="driver_speeds",
+            cast=lambda v: None if v is None else float(v),
+        )
         self.dt = float(dt)
         self.horizon = float(horizon)
         self.order_timeout = order_timeout
@@ -113,11 +171,36 @@ class RidePoolEnv:
             area=area, horizon=self.horizon, num_orders=200, rng=seed
         )
 
+        # --- Region model (single source of truth) -------------------------
+        # Region centres come from, in priority order: explicit
+        # ``relocation_points``, then user ``relocation_centroids``, then the
+        # auto-generated uniform grid. Only the grid model carries (rows, cols)
+        # metadata enabling geometric N-adjacency; the other two are treated as
+        # an irregular point set whose adjacency is K-nearest.
+        self.relocation_adjacency = int(relocation_adjacency)
+        self.relocation_neighbours_k = int(relocation_neighbours_k)
+        self._grid_shape: Optional[Tuple[int, int]] = None
+        if relocation_points is not None:
+            centres = list(relocation_points)
+        elif relocation_centroids is not None:
+            centres = list(relocation_centroids)
+        else:
+            centres = self._build_relocation_grid(relocation_grid)
+            # rows, cols recorded so adjacency can use the regular lattice.
+            self._grid_shape = (int(relocation_grid[0]), int(relocation_grid[1]))
+
         # Stored as an immutable tuple so that observations can share it by
         # reference with zero copy while making it impossible for a policy to
         # corrupt env state by mutating the relocation grid in place.
         self.relocation_points: Tuple[Coord, ...] = tuple(
-            relocation_points or self._build_relocation_grid(relocation_grid)
+            (float(x), float(y)) for (x, y) in centres
+        )
+        # Per-region neighbour region indices (the region-adjacency graph),
+        # precomputed once: geometric N-adjacency for the grid model, else
+        # K-nearest for an irregular centroid set. Exposed via observations so
+        # the policy reuses exactly this adjacency.
+        self.region_neighbours: Tuple[Tuple[int, ...], ...] = (
+            self._build_region_neighbours()
         )
 
         self._seed = seed
@@ -132,6 +215,26 @@ class RidePoolEnv:
         self._next_inject_idx: int = 0
 
     # ------------------------------------------------------------------ setup
+    def _resolve_per_driver(self, values, default, name: str, cast):
+        """Normalise a per-driver spec into a length-``num_drivers`` list.
+
+        ``values`` may be ``None`` (every vehicle gets ``default``) or a
+        sequence of exactly ``num_drivers`` entries (vehicle ``i`` gets
+        ``values[i]``). Each entry is passed through ``cast`` for type/None
+        normalisation. A wrong-length sequence is a configuration error and
+        raises ``ValueError`` so mistakes surface immediately rather than
+        silently truncating/recycling the fleet.
+        """
+        if values is None:
+            return [cast(default) for _ in range(self.num_drivers)]
+        seq = list(values)
+        if len(seq) != self.num_drivers:
+            raise ValueError(
+                f"{name} must have length num_drivers ({self.num_drivers}), "
+                f"got {len(seq)}."
+            )
+        return [cast(v) for v in seq]
+
     def _build_relocation_grid(self, grid: Tuple[int, int]) -> List[Coord]:
         """Evenly spaced cell-centre coordinates over the service area."""
         rows, cols = grid
@@ -139,6 +242,76 @@ class RidePoolEnv:
         xs = (np.arange(cols) + 0.5) / cols * (xmax - xmin) + xmin
         ys = (np.arange(rows) + 0.5) / rows * (ymax - ymin) + ymin
         return [(float(x), float(y)) for y in ys for x in xs]
+
+    def _build_region_neighbours(self) -> Tuple[Tuple[int, ...], ...]:
+        """Precompute each region's neighbour-region indices (adjacency graph).
+
+        Two adjacency models:
+
+        * Grid model (``self._grid_shape`` is set): geometric N-adjacency on the
+          regular lattice -- 4 (von Neumann) or 8 (Moore, incl. diagonals)
+          neighbours per cell, clipped at the lattice border. The region index
+          is row-major (``idx = row * cols + col``), matching
+          :meth:`_build_relocation_grid`'s emission order.
+        * Centroid model (irregular point set): the K spatially-nearest other
+          region centres by Euclidean distance, since N-gon adjacency is
+          undefined for an arbitrary point set. K = ``relocation_neighbours_k``.
+
+        Returns a tuple (immutable, shareable by reference) of per-region
+        neighbour-index tuples, self excluded.
+        """
+        pts = self.relocation_points
+        n = len(pts)
+        if n == 0:
+            return tuple()
+
+        if self._grid_shape is not None:
+            rows, cols = self._grid_shape
+            if self.relocation_adjacency == 4:
+                offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            else:  # 8-adjacency (Moore) is the default for any non-4 value.
+                offsets = [
+                    (dr, dc)
+                    for dr in (-1, 0, 1)
+                    for dc in (-1, 0, 1)
+                    if not (dr == 0 and dc == 0)
+                ]
+            neigh: List[Tuple[int, ...]] = []
+            for idx in range(n):
+                r, c = divmod(idx, cols)
+                here = []
+                for dr, dc in offsets:
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < rows and 0 <= nc < cols:
+                        here.append(nr * cols + nc)
+                neigh.append(tuple(here))
+            return tuple(neigh)
+
+        # Centroid model: K-nearest other centres (brute force; the region count
+        # is small -- e.g. a few hundred NYC zones -- so O(n^2) is negligible and
+        # paid once at construction).
+        k = max(0, min(self.relocation_neighbours_k, n - 1))
+        arr = np.asarray(pts, dtype=float)  # [n, 2]
+        neigh = []
+        for i in range(n):
+            d2 = ((arr - arr[i]) ** 2).sum(axis=1)
+            d2[i] = np.inf  # exclude self
+            nearest = np.argsort(d2)[:k]
+            neigh.append(tuple(int(j) for j in nearest))
+        return tuple(neigh)
+
+    def _current_region(self, coord: Coord) -> int:
+        """Index of the region whose centre is nearest to ``coord``.
+
+        The driver's 'current region' is the nearest region centre (a
+        well-defined, unambiguous partition for both the grid and the irregular
+        centroid models). With no regions defined, returns -1.
+        """
+        if not self.relocation_points:
+            return -1
+        arr = np.asarray(self.relocation_points, dtype=float)
+        d2 = ((arr - np.asarray(coord, dtype=float)) ** 2).sum(axis=1)
+        return int(np.argmin(d2))
 
     def _in_area(self, coord: Coord) -> bool:
         xmin, ymin, xmax, ymax = self.area
@@ -164,6 +337,8 @@ class RidePoolEnv:
         # the service-area bounding box.
         self.drivers = {}
         for did in range(self.num_drivers):
+            cap = self.driver_capacities[did]
+            spd = self.driver_speeds[did]
             if graph_mode:
                 n_nodes = len(self.network.node_coords)
                 node_idx = int(self._rng.integers(0, n_nodes))
@@ -171,7 +346,8 @@ class RidePoolEnv:
                 self.drivers[did] = Driver(
                     driver_id=did,
                     location=loc,
-                    capacity=self.driver_capacity,
+                    capacity=cap,
+                    speed=spd,
                     node_idx=node_idx,
                 )
             else:
@@ -180,7 +356,7 @@ class RidePoolEnv:
                     float(self._rng.uniform(ymin, ymax)),
                 )
                 self.drivers[did] = Driver(
-                    driver_id=did, location=loc, capacity=self.driver_capacity
+                    driver_id=did, location=loc, capacity=cap, speed=spd
                 )
 
         # Generate the full order set; inject those due at t == 0.
@@ -369,6 +545,7 @@ class RidePoolEnv:
             self._pending_ids.remove(oid)
 
             event["assigned_orders"].append(oid)
+            event["assigned_party_sizes"][oid] = order.num_passengers
             solo = self.network.shortest_path(order.origin, order.destination)
             event["assigned_solo_times"][oid] = solo.travel_time
 
@@ -382,34 +559,45 @@ class RidePoolEnv:
             )
 
             # ----------------------------------------------------------------
-            # Pooling-induced detour attributed to accepting these new orders.
-            # Two additive parts, both measured along the realised (re-planned)
-            # route and clamped at zero (re-sequencing can only be accepted if
-            # it does not make any single order strictly worse than its own
-            # direct/baseline reference; tiny negatives are numerical noise):
-            #
-            #   (a) the NEW orders' own detour -- their in-vehicle time on the
-            #       pooled route minus the direct (solo) ride they would have
-            #       had alone;
-            #   (b) the EXTRA delivery delay imposed on orders the driver had
-            #       ALREADY committed to -- their drop-off time on the new route
-            #       minus their drop-off time on the counterfactual route that
-            #       never accepted these new orders.
-            # ----------------------------------------------------------------
-            extra_detour = 0.0
-            # (a) new orders' own pooling detour.
+            # (1) Service-time of each NEWLY assigned order: its predicted
+            #     END-TO-END time from the user's request to the planned
+            #     drop-off, measured on the re-optimised route. Both segments
+            #     are included:
+            #       * (now - request_time): time already spent on the platform
+            #         from the moment the user sent the request to this dispatch
+            #         (request -> pending -> assignment);
+            #       * after_times[oid]["dropoff"]: planned minutes from NOW until
+            #         the order is dropped off (covers the remaining pickup wait
+            #         AND the in-vehicle ride on the pooled route).
+            #     after_times is measured from the driver's current position
+            #     (relative to the current clock T == self.time), so the
+            #     absolute predicted drop-off clock is T + after_times[...] and
+            #     the end-to-end time is that minus request_time.
             for oid in accepted:
-                solo_time = event["assigned_solo_times"][oid]
                 at = after_times.get(oid, {})
-                if "pickup" in at and "dropoff" in at:
-                    pooled_ride = at["dropoff"] - at["pickup"]
-                    extra_detour += max(0.0, pooled_ride - solo_time)
-            # (b) added delivery delay on previously committed orders: their new
-            # drop-off time vs. the maintained pre-insertion estimate.
+                if "dropoff" in at:
+                    req = self.orders[oid].request_time
+                    end_to_end = (self.time + at["dropoff"]) - req
+                    event["assigned_service_times"][oid] = max(0.0, end_to_end)
+
+            # ----------------------------------------------------------------
+            # (2) Re-routing impact on already-committed EN-ROUTE orders: how
+            #     much each one's predicted drop-off time changes because the
+            #     new orders were inserted and the whole route re-optimised.
+            #     SIGNED (not clamped): a later drop-off is a positive penalty,
+            #     an earlier one is negative (a reward). Each en-route order is
+            #     measured separately and summed. The drop-off time already
+            #     reflects any change to that order's pickup time too (its pickup
+            #     precedes its drop-off on the same route), per design.
+            #
+            #     before_eta[oid] and after_times[oid]["dropoff"] share the same
+            #     basis (minutes-to-drop-off from the current position/clock),
+            #     so their difference is the pure re-routing delta.
+            extra_detour = 0.0
             for oid, old_eta in before_eta.items():
                 at = after_times.get(oid, {})
                 if "dropoff" in at:
-                    extra_detour += max(0.0, at["dropoff"] - old_eta)
+                    extra_detour += at["dropoff"] - old_eta
 
             event["extra_detour_time"] += extra_detour
 
@@ -469,7 +657,7 @@ class RidePoolEnv:
             self._move_driver_graph(driver, event)
             return
 
-        budget_dist = self.network.speed * self.dt
+        budget_dist = self._driver_speed(driver) * self.dt
         moved = 0.0
         started_onboard = driver.onboard_passengers
 
@@ -493,7 +681,9 @@ class RidePoolEnv:
                 budget_dist = 0.0
 
         event["distance_moved"] = moved
-        event["time_moved"] = self.network.travel_time(moved)
+        # Time spent moving uses the driver's own speed when set so a
+        # heterogeneous fleet's per-vehicle travel time is reported correctly.
+        event["time_moved"] = moved / max(self._driver_speed(driver), 1e-12)
         event["is_empty_move"] = moved > 0 and started_onboard == 0
         event["is_idle_wait"] = (
             moved == 0
@@ -515,6 +705,15 @@ class RidePoolEnv:
                 order.eta -= self.dt
 
     # ---------------------------------------------------- graph-mode movement
+    def _driver_speed(self, driver: Driver) -> float:
+        """Effective travel speed for a driver this step.
+
+        Returns the driver's own ``speed`` when set (heterogeneous fleet), else
+        the road network's default ``speed`` (homogeneous fleet). Centralising
+        this keeps both the abstract and graph movement paths consistent.
+        """
+        return self.network.speed if driver.speed is None else driver.speed
+
     def _is_graph_network(self) -> bool:
         """True if the road network supports node-level routing (OSMnx-style).
 
@@ -560,11 +759,12 @@ class RidePoolEnv:
         several steps via ``edge_pos_m``. Requires ``budget > 0`` (asserted).
         """
         net = self.network
-        budget = net.speed * self.dt
+        speed = self._driver_speed(driver)
+        budget = speed * self.dt
         assert budget > 0, (
             "graph movement requires a strictly positive distance budget "
-            "(network.speed * dt); got speed="
-            f"{net.speed} dt={self.dt}. A zero budget would deadlock drivers."
+            "(driver/network speed * dt); got speed="
+            f"{speed} dt={self.dt}. A zero budget would deadlock drivers."
         )
         moved = 0.0
         started_onboard = driver.onboard_passengers
@@ -633,7 +833,7 @@ class RidePoolEnv:
                 break
 
         event["distance_moved"] = moved
-        event["time_moved"] = net.travel_time(moved)
+        event["time_moved"] = moved / max(speed, 1e-12)
         event["is_empty_move"] = moved > 0 and started_onboard == 0
         event["is_idle_wait"] = (
             moved == 0
@@ -732,25 +932,62 @@ class RidePoolEnv:
                     "location": d.location,
                     "status": d.status.value,
                     "capacity": d.capacity,
+                    # Effective per-vehicle travel speed (own speed if set, else
+                    # the network default), exposed so a policy can reason about
+                    # heterogeneous fleets.
+                    "speed": self._driver_speed(d),
                     "onboard_passengers": d.onboard_passengers,
                     "assigned_orders": list(d.assigned_orders),
+                    # En-route order details (origin, destination, party,
+                    # onboard flag, remaining eta) for sequence-based feature
+                    # encoders. The flat MLP encoder ignores this field.
+                    "assigned_order_details": [
+                        {
+                            "order_id": oid,
+                            "origin": self.orders[oid].origin,
+                            "destination": self.orders[oid].destination,
+                            "num_passengers": self.orders[oid].num_passengers,
+                            "onboard": self.orders[oid].status
+                            == OrderStatus.ONBOARD,
+                            "eta": self.orders[oid].eta,
+                        }
+                        for oid in d.assigned_orders
+                    ],
                     # Onboard + assigned-but-not-yet-picked-up passengers: the
                     # authoritative capacity baseline against which new bids are
                     # checked. Exposed so policies / learners see true remaining
                     # capacity and future committed load, not just onboard.
                     "committed_passengers": d.committed_passengers(self.orders),
+                    # Index of the region the driver is currently in (nearest
+                    # region centre). Lets a relocation policy restrict targets
+                    # to this region's neighbours -- the env's own adjacency.
+                    "current_region": self._current_region(d.location),
                 },
                 "all_drivers": all_drivers,
                 "pending_orders": pending,
                 "time": self.time,
                 "relocation_points": self.relocation_points,
+                # Region-adjacency graph (per-region neighbour indices) and the
+                # region count, shared by reference. Single source of truth for
+                # which regions a driver may relocate to from its current one.
+                "region_neighbours": self.region_neighbours,
             }
         return obs
 
     def _new_event(self) -> Dict:
         return {
             "assigned_orders": [],
+            # Per newly-assigned order: its passenger (party) count. Used by the
+            # reward's revenue bonus, which scales fare by the number of riders.
+            "assigned_party_sizes": {},
             "assigned_solo_times": {},
+            # Per newly-assigned order: predicted END-TO-END service time (min)
+            # from the user's request to the planned drop-off, i.e.
+            #   (now - order.request_time)            # platform + dispatch wait
+            # + planned time-to-dropoff on the re-optimised route   # pickup +
+            #                                                        # in-vehicle
+            # Used by the reward's service-time penalty.
+            "assigned_service_times": {},
             "completed_orders": [],
             "picked_up_orders": [],
             "distance_moved": 0.0,

@@ -9,7 +9,7 @@ and training can never drift apart in how they featurise a state.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -31,6 +31,11 @@ def encode_state(
     index: Optional[GridIndex] = None,
     k_nearest: int = 20,
     use_knn: bool = False,
+    structured: bool = False,
+    pickup_distance_threshold: Optional[float] = None,
+    distance_fn: Optional[Callable[[Coord, Coord], float]] = None,
+    coord_to_km: Tuple[float, float] = (1.0, 1.0),
+    network_distance_is_metres: bool = False,
 ) -> Tuple[StateView, List[int], List[int]]:
     """Encode an observation into a :class:`StateView`.
 
@@ -113,11 +118,64 @@ def encode_state(
         candidate_cols=candidate_cols,
     )
 
+    # Pickup-distance gate: a (driver, order) pair is only legal if the pickup
+    # distance (order origin -> driver location) is within the threshold. This
+    # is ANDed onto the capacity/candidacy mask, so an order with no driver in
+    # range simply stays pending. ``distance_fn`` defaults to Euclidean when not
+    # supplied (the abstract scenarios' metric); callers measuring under a road
+    # network pass ``network.distance`` for the true pickup distance.
+    if pickup_distance_threshold is not None and m > 0:
+        driver_locs = np.array(
+            [observations[d]["self"]["location"] for d in driver_ids],
+            dtype=np.float64,
+        )  # [N, 2]
+        order_origins = np.array(
+            [o["origin"] for o in pending], dtype=np.float64
+        )  # [M, 2]
+        if distance_fn is None:
+            # Vectorised straight-line distance in KILOMETRES. Coordinate
+            # deltas are scaled to km by coord_to_km (= (1, 1) for the
+            # abstract km scenarios; = (111*cos(lat0), 111) for (lon, lat)
+            # graph scenarios, a lat-linear correction adequate at city
+            # scale). Compared on squared distance to skip the sqrt; the
+            # threshold is already in km.
+            kx, ky = coord_to_km
+            diff = driver_locs[:, None, :] - order_origins[None, :, :]  # [N,M,2]
+            diff[:, :, 0] *= kx
+            diff[:, :, 1] *= ky
+            d2 = np.einsum("ijk,ijk->ij", diff, diff)  # [N, M] squared km
+            dist_ok = d2 <= (pickup_distance_threshold ** 2)
+        else:
+            # Exact road-network distance: one shortest-path lookup per pair.
+            # SLOW on graph scenarios; only used when the caller explicitly asks
+            # for the network metric. Threshold is in km; OSMnx returns metres,
+            # so scale the threshold up to metres when needed.
+            thr = pickup_distance_threshold * (
+                1000.0 if network_distance_is_metres else 1.0
+            )
+            dist_ok = np.zeros((n, m), dtype=bool)
+            for i in range(n):
+                dloc = tuple(driver_locs[i])
+                for j in range(m):
+                    dist_ok[i, j] = (
+                        distance_fn(tuple(order_origins[j]), dloc) <= thr
+                    )
+        legal_mask = legal_mask & dist_ok
+
+    drv_non_seq = drv_seq = drv_mask = None
+    if structured:
+        _, drv_non_seq, drv_seq, drv_mask = encoder.encode_drivers_struct(
+            {d: observations[d] for d in driver_ids}, time
+        )
+
     state = StateView(
         driver_feats=drv_feats,
         order_feats=ord_feats,
         legal_mask=legal_mask,
         free_cap=free_cap,
         dummy_feat=encoder.dummy_order(),
+        driver_non_seq=drv_non_seq,
+        driver_seq=drv_seq,
+        driver_mask=drv_mask,
     )
     return state, driver_ids, order_ids

@@ -55,6 +55,12 @@ class StateView:
     legal_mask: np.ndarray
     free_cap: np.ndarray
     dummy_feat: np.ndarray
+    # Structured driver inputs for Assignment-Net (None for the flat MLP path):
+    #   driver_non_seq [N, non_seq_dim], driver_seq [N, L, tok_dim],
+    #   driver_mask [N, L].
+    driver_non_seq: Optional[np.ndarray] = None
+    driver_seq: Optional[np.ndarray] = None
+    driver_mask: Optional[np.ndarray] = None
 
     @property
     def n_drivers(self) -> int:
@@ -95,6 +101,12 @@ class StepSnapshot:
     rewards: np.ndarray
     next_state: StateView
     done: bool
+    # Assignment-Net current-Q inputs (None for the flat MLP path). Per driver
+    # the chosen real order's feature vector (irrelevant where dummy) and a
+    # boolean flag marking the no-order (dummy) action, which is scored through
+    # the net's learnable dummy embedding rather than any stored vector.
+    action_order_feats: Optional[np.ndarray] = None
+    action_is_dummy: Optional[np.ndarray] = None
 
 
 class ReplayBuffer:

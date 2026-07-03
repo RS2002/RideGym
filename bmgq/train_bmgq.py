@@ -1,13 +1,17 @@
-"""Formal IDDQN trainer.
+"""Formal BMG-Q (GATDDQN) trainer.
 
-End-to-end training loop for the Independent Double DQN with bipartite-matching
-agent on the standard ride-pooling benchmark scenario.
+A near-exact mirror of :mod:`mfddqn.train_mfddqn` / :mod:`iddqn.train_iddqn` --
+the SAME ``BenchmarkConfig``, data-collection / eval cadence, nearest + Hungarian
+baseline comparison, CSV logging and checkpointing -- so BMG-Q, MFDDQN and IDDQN
+numbers are directly comparable. The only methodological difference is the
+agent: each driver's state is enriched by graph attention over its top-K nearest
+neighbours before pairing with orders; see :mod:`bmgq.gat`.
 
 Run:
 
-    python -m iddqn.train_iddqn
+    python -m bmgq.train_bmgq
 
-All hyper-parameters are in :class:`TrainConfig`.
+All hyper-parameters are in :class:`BMGTrainConfig`.
 """
 
 from __future__ import annotations
@@ -16,7 +20,6 @@ import csv
 import json
 import os
 import time
-import dataclasses
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
@@ -28,49 +31,56 @@ from benchmark.baselines import NearestDistanceDispatch, HungarianDispatch
 from benchmark.runner import run_episode
 
 from iddqn.features import FeatureConfig, FeatureEncoder
-from iddqn.qnet import PairQNet
-from iddqn.inference import IDDQNActor
-from iddqn.assignment_net import AssignmentNet
-from iddqn.assignment_inference import AssignmentActor
 from iddqn.exploration import QNoiseExplorer, AnnealSchedule
-from iddqn.replay import StepSnapshot, ReplayBuffer
+from iddqn.replay import ReplayBuffer
 
-from iddqn.agent import IDDQNAgent, AssignmentAgent, IDDQNConfig
+from bmgq.gat_qnet import GATQNet
+from bmgq.bmgq_inference import BMGQActor
+from bmgq.bmgq_agent import BMGQAgent, BMGQConfig
+from bmgq.bmgq_replay import BMGStepSnapshot
 
 
 @dataclass
-class TrainConfig:
-    """IDDQN training hyper-parameters and run controls."""
+class BMGTrainConfig:
+    """BMG-Q training hyper-parameters. Shares every field with TrainConfig for
+    parity; the GAT-specific additions are ``neighbours_k``, ``embed_dim``,
+    ``num_heads`` and ``gat_layers``."""
 
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
 
+    # Optimisation / agent.
     gamma: float = 0.9998
     lr: float = 5e-4
     batch_size: int = 8
     tau: float = 0.005
     target_sync_every: int = 20
     grad_clip: float = 1.0
-    hidden: tuple = (128, 128)
+    hidden: tuple = (128,)
 
-    net_arch: str = "mlp"
+    # GAT specifics.
+    neighbours_k: int = 20
     embed_dim: int = 64
-    tf_heads: int = 4
-    max_seq_len: int = 6
+    num_heads: int = 1
+    gat_layers: int = 1
 
+    # Replay / schedule.
     replay_capacity: int = 6_000
     warmup_snapshots: int = 120
     updates_per_step: int = 1
 
+    # Episodes.
     num_episodes: int = 500
     eval_every: int = 10
     eval_baselines: bool = True
-    # Train/val/test split control (NYC multi-window scenarios). Periodic
-    # evaluation runs on eval_split (held-out "val"); a final evaluation after
-    # training runs on test_split ("test"). Ignored without a split pool.
+    # Train/val/test split control (NYC multi-window scenarios). When the
+    # benchmark uses a split pool (benchmark.nyc_splits_dir set), periodic
+    # evaluation runs on eval_split (held-out "val") and a final evaluation
+    # after training runs on test_split ("test"). Ignored without a split pool.
     eval_split: str = "val"
     test_split: str = "test"
     final_test: bool = True
 
+    # Exploration anneal.
     anneal_t0: float = 1.0
     anneal_mode: str = "exponential"
     anneal_decay: float = 0.99
@@ -80,12 +90,14 @@ class TrainConfig:
     scale_stat: str = "std"
     scale_floor: float = 1e-3
 
+    # Candidate pruning (kept for parity; dense by default).
     use_knn: bool = False
     k_nearest: int = 20
 
+    # Infra.
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 0
-    out_dir: str = "iddqn/runs"
+    out_dir: str = "bmgq/runs"
     run_name: Optional[str] = None
     save_every: int = 10
     save_eval_details: bool = True
@@ -93,16 +105,21 @@ class TrainConfig:
 
 
 class _GreedyActorDispatch:
-    """Adapts an :class:`IDDQNActor` to the benchmark ``act(observations)`` API."""
+    """Adapts a :class:`BMGQActor` to the benchmark ``act(observations)`` API.
 
-    def __init__(self, actor: IDDQNActor, network):
+    Always greedy (``explore_step=None``); exposes ``last_assignment_distances``
+    for the recorder, on the same footing as the baselines.
+    """
+
+    def __init__(self, actor: BMGQActor, network):
         self._actor = actor
         self._network = network
         self.last_assignment_distances: Dict[int, float] = {}
 
     def act(self, observations: Dict[int, Dict]) -> Dict[int, Dict]:
-        out = self._actor.act(observations, explore_step=None)
-        actions = out[0]
+        actions, _state, _nb, _cc, _dbg = self._actor.act(
+            observations, explore_step=None
+        )
         self.last_assignment_distances = {}
         if observations:
             for did, act in actions.items():
@@ -119,10 +136,10 @@ class _GreedyActorDispatch:
         return actions
 
 
-class IDDQNTrainer:
+class BMGQTrainer:
     """Owns the env, agent, replay buffer, explorer, and the run loop."""
 
-    def __init__(self, cfg: TrainConfig):
+    def __init__(self, cfg: BMGTrainConfig):
         self.cfg = cfg
         bm = cfg.benchmark
 
@@ -138,6 +155,13 @@ class IDDQNTrainer:
             area = bm.area
         self.area = area
 
+        # Pickup-distance gate unit conversion. The threshold is in km.
+        # Abstract scenarios already use km coordinates -> (1, 1) and the
+        # network metric is km. Graph scenarios (nyc / osmnx) use (lon,
+        # lat) degrees -> scale to km with a lat-linear correction
+        # (111 km/deg lat; 111*cos(lat0) km/deg lon at the area's centre
+        # latitude), and OSMnx returns metres so the network gate scales
+        # the threshold to metres.
         if bm.network_kind in ("osmnx", "nyc"):
             _lat0 = 0.5 * (area[1] + area[3])
             self._coord_to_km = (
@@ -154,46 +178,33 @@ class IDDQNTrainer:
             max_capacity=bm.driver_capacity,
             max_wait=bm.order_timeout or float(bm.horizon),
             horizon=bm.horizon,
-            max_seq_len=cfg.max_seq_len,
         )
         self.encoder = FeatureEncoder(self.fc)
 
-        self.net_arch = cfg.net_arch
-        agent_cfg = IDDQNConfig(
-            gamma=cfg.gamma,
-            lr=cfg.lr,
-            batch_size=cfg.batch_size,
-            tau=cfg.tau,
-            target_sync_every=cfg.target_sync_every,
-            grad_clip=cfg.grad_clip,
-            device=cfg.device,
-            # Idling rule for the Q-target's next-state action selection; must
-            # match the actor below so target and behaviour agree.
-            allow_idle=bm.allow_idle,
+        qnet = GATQNet(
+            self.fc.driver_dim,
+            self.fc.order_dim,
+            embed_dim=cfg.embed_dim,
+            num_heads=cfg.num_heads,
+            hidden=cfg.hidden,
+            gat_layers=cfg.gat_layers,
         )
-        if cfg.net_arch == "assignment":
-            net = AssignmentNet(
-                non_seq_dim=self.fc.non_seq_dim,
-                seq_token_dim=self.fc.seq_token_dim,
-                order_dim=self.fc.order_dim,
-                embed_dim=cfg.embed_dim,
-                tf_heads=cfg.tf_heads,
-            )
-            self.agent = AssignmentAgent(net, agent_cfg)
-        else:
-                self.agent = IDDQNAgent(
-                self.fc.pair_dim,
-                agent_cfg,
-                # Two-tower PairQNet: encode the driver half and the order half
-                # separately (split at driver_dim), then fuse. driver_dim is the
-                # concatenation split point every caller uses (driver first).
-                qnet=PairQNet(
-                    self.fc.pair_dim,
-                    hidden=cfg.hidden,
-                    driver_dim=self.fc.driver_dim,
-                    embed_dim=cfg.embed_dim,
-                ),
-            )
+        self.agent = BMGQAgent(
+            self.fc.driver_dim,
+            self.fc.order_dim,
+            cfg.neighbours_k,
+            BMGQConfig(
+                gamma=cfg.gamma,
+                lr=cfg.lr,
+                batch_size=cfg.batch_size,
+                tau=cfg.tau,
+                target_sync_every=cfg.target_sync_every,
+                grad_clip=cfg.grad_clip,
+                device=cfg.device,
+                allow_idle=bm.allow_idle,
+            ),
+            qnet=qnet,
+        )
 
         self.explorer = QNoiseExplorer(
             schedule=AnnealSchedule(
@@ -209,35 +220,29 @@ class IDDQNTrainer:
             rng=np.random.default_rng(cfg.seed),
         )
 
-        actor_cls = (
-            AssignmentActor if cfg.net_arch == "assignment" else IDDQNActor
-        )
-        self.actor = actor_cls(
+        self.actor = BMGQActor(
             self.agent.online,
             self.encoder,
             area,
             self.network.speed,
+            neighbours_k=cfg.neighbours_k,
             k_nearest=cfg.k_nearest,
             use_knn=cfg.use_knn,
             device=cfg.device,
             explorer=self.explorer,
             pickup_distance_threshold=bm.pickup_distance_threshold,
             distance_fn=(
-                self.network.distance
-                if bm.pickup_distance_metric == "network"
-                                else None
+                self.network.distance if bm.pickup_distance_metric == "network" else None
             ),
             coord_to_km=self._coord_to_km,
             network_distance_is_metres=self._net_dist_metres,
-            # When False, a driver actively takes no order only as a passive
-            # fallback (assigned a legal order whenever one is available).
             allow_idle=bm.allow_idle,
         )
 
         self.buffer = ReplayBuffer(cfg.replay_capacity)
         self.global_step = 0
 
-        run_name = cfg.run_name or time.strftime("iddqn_%Y%m%d_%H%M%S")
+        run_name = cfg.run_name or time.strftime("bmgq_%Y%m%d_%H%M%S")
         self.run_dir = os.path.join(cfg.out_dir, run_name)
         os.makedirs(self.run_dir, exist_ok=True)
         self.ckpt_dir = os.path.join(self.run_dir, "checkpoints")
@@ -249,34 +254,29 @@ class IDDQNTrainer:
         self._train_rows: List[Dict] = []
         self._eval_rows: List[Dict] = []
 
-        with open(os.path.join(self.run_dir, "config.json"), "w", encoding="utf-8") as f:
-            json.dump(_config_to_jsonable(cfg), f, indent=2)
+        with open(
+            os.path.join(self.run_dir, "config.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump(asdict(cfg), f, indent=2)
 
-        # Per-split baseline caches (val baselines differ from test baselines).
+        # Per-split baseline caches (val vs test draw different windows).
         self._baseline_cache: Dict[str, Dict[str, Dict]] = {}
 
         # Pre-build eval benchmark configs. With a split pool, val/test draw
-        # from their own held-out window pools via nyc_split. Without one these
-        # are just the training benchmark (single-file replay).
+        # from their own held-out window pools via nyc_split; without one
+        # these are just the training benchmark (single-file replay).
+        import dataclasses as _dc
         self._uses_splits = getattr(bm, "nyc_splits_dir", None) is not None
         if self._uses_splits:
-            self._eval_bm = dataclasses.replace(bm, nyc_split=cfg.eval_split)
-            self._test_bm = dataclasses.replace(bm, nyc_split=cfg.test_split)
+            self._eval_bm = _dc.replace(bm, nyc_split=cfg.eval_split)
+            self._test_bm = _dc.replace(bm, nyc_split=cfg.test_split)
         else:
             self._eval_bm = bm
             self._test_bm = bm
 
-    def _make_snapshot(self, prev, next_state, done: bool) -> StepSnapshot:
-        state, act_data, rvec = prev
-        if self.net_arch == "assignment":
-            aof, adummy = act_data
-            return StepSnapshot(
-                state, None, rvec, next_state, done,
-                action_order_feats=aof, action_is_dummy=adummy,
-            )
-        return StepSnapshot(state, act_data, rvec, next_state, done)
-
+    # --------------------------------------------------------------- collect
     def collect_episode(self, episode: int = 0) -> Dict:
+        """Run one behaviour-policy episode, push snapshots, and train."""
         cfg = self.cfg
         # Per-episode reset seed so train-mode window sampling AND random
         # party sizes vary across episodes, while staying reproducible for a
@@ -286,20 +286,13 @@ class IDDQNTrainer:
         losses: List[float] = []
         ep_reward = 0.0
         steps = 0
+        # prev = (state, neighbours, chosen_col, reward_vec) of the PREVIOUS step.
         prev = None
 
-        assignment = self.net_arch == "assignment"
         while True:
-            if assignment:
-                actions, state, aof, adummy, _dbg = self.actor.act(
-                    obs, explore_step=self.global_step
-                )
-                act_data = (aof, adummy)
-            else:
-                actions, state, apf, _dbg = self.actor.act(
-                    obs, explore_step=self.global_step
-                )
-                act_data = apf
+            actions, state, neighbours, chosen_col, _dbg = self.actor.act(
+                obs, explore_step=self.global_step
+            )
             nobs, rew, dones, _info = self.env.step(actions)
 
             rvec = np.array([rew[d] for d in obs.keys()], dtype=np.float32)
@@ -307,8 +300,18 @@ class IDDQNTrainer:
 
             done = dones["__all__"]
             if prev is not None:
-                self.buffer.push(self._make_snapshot(prev, state, False))
-            prev = (state, act_data, rvec)
+                self.buffer.push(
+                    BMGStepSnapshot(
+                        state=prev[0],
+                        state_neighbours=prev[1],
+                        chosen_col=prev[2],
+                        rewards=prev[3],
+                        next_state=state,
+                        next_state_neighbours=neighbours,
+                        done=False,
+                    )
+                )
+            prev = (state, neighbours, chosen_col, rvec)
 
             if self.buffer.can_sample(cfg.batch_size) and (
                 len(self.buffer) >= cfg.warmup_snapshots
@@ -322,7 +325,17 @@ class IDDQNTrainer:
             steps += 1
 
             if done:
-                self.buffer.push(self._make_snapshot(prev, state, True))
+                self.buffer.push(
+                    BMGStepSnapshot(
+                        state=prev[0],
+                        state_neighbours=prev[1],
+                        chosen_col=prev[2],
+                        rewards=prev[3],
+                        next_state=state,
+                        next_state_neighbours=neighbours,
+                        done=True,
+                    )
+                )
                 break
 
         return {
@@ -334,8 +347,9 @@ class IDDQNTrainer:
             "replay_size": len(self.buffer),
         }
 
+    # --------------------------------------------------------------- evaluate
     def evaluate(self, episode: int, split: Optional[str] = None) -> Dict:
-        """Greedy evaluation on a given split (val by default, or test)."""
+        """Greedy evaluation on a split (val by default, or test)."""
         cfg = self.cfg
         split = split or cfg.eval_split
         is_test = split == cfg.test_split
@@ -345,7 +359,7 @@ class IDDQNTrainer:
         eval_out = self.eval_details_dir if cfg.save_eval_details else None
         summary, _rec = run_episode(
             dispatch,
-            algorithm_name=f"iddqn_{tag}_ep{episode:04d}",
+            algorithm_name=f"bmgq_{tag}_ep{episode:04d}",
             cfg=eval_bm,
             out_dir=eval_out,
             verbose=False,
@@ -406,7 +420,7 @@ class IDDQNTrainer:
         return out
 
     @staticmethod
-    def _print_eval_table(episode: int, tag: str, iddqn: Dict, baselines: Dict[str, Dict]):
+    def _print_eval_table(episode: int, tag: str, bmgq: Dict, baselines: Dict[str, Dict]):
         cols = [
             ("total_reward", "reward"),
             ("service_rate", "service"),
@@ -434,13 +448,14 @@ class IDDQNTrainer:
                     cells.append(f"{s[k]:>10.4f}")
             print(f"{name:12s}" + "".join(cells))
 
-        _line("iddqn", iddqn)
+        _line("bmgq", bmgq)
         for name, s in baselines.items():
             _line(name, s)
         print()
 
+    # --------------------------------------------------------------- checkpoint
     def save_checkpoint(self, episode: int) -> str:
-        path = os.path.join(self.ckpt_dir, f"iddqn_ep{episode}.pt")
+        path = os.path.join(self.ckpt_dir, f"bmgq_ep{episode}.pt")
         torch.save(
             {
                 "episode": episode,
@@ -448,8 +463,8 @@ class IDDQNTrainer:
                 "online": self.agent.online.state_dict(),
                 "target": self.agent.target.state_dict(),
                 "optim": self.agent.optim.state_dict(),
-                "net_arch": self.net_arch,
-                "pair_dim": self.fc.pair_dim,
+                "driver_dim": self.fc.driver_dim,
+                "order_dim": self.fc.order_dim,
             },
             path,
         )
@@ -462,6 +477,7 @@ class IDDQNTrainer:
         self.agent.optim.load_state_dict(ckpt["optim"])
         self.global_step = ckpt.get("global_step", 0)
 
+    # --------------------------------------------------------------- main loop
     def train(self) -> None:
         cfg = self.cfg
         self.env.reset(seed=cfg.benchmark.seed)
@@ -473,8 +489,10 @@ class IDDQNTrainer:
                 else f"{cfg.benchmark.num_orders}"
             )
             print(
-                f"IDDQN training: {cfg.num_episodes} episodes, "
-                f"device={cfg.device}, pair_dim={self.fc.pair_dim}, "
+                f"BMG-Q training: {cfg.num_episodes} episodes, "
+                f"device={cfg.device}, driver_dim={self.fc.driver_dim}, "
+                f"order_dim={self.fc.order_dim}, embed={cfg.embed_dim}, "
+                f"heads={cfg.num_heads}, K={cfg.neighbours_k}, "
                 f"network={cfg.benchmark.network_kind}, "
                 f"drivers={cfg.benchmark.num_drivers}, "
                 f"orders={order_src}, use_knn={cfg.use_knn}"
@@ -521,10 +539,6 @@ class IDDQNTrainer:
             print(f"\nDONE in {time.time() - t_run:.1f}s. Logs in {self.run_dir}")
 
 
-def _config_to_jsonable(cfg: TrainConfig) -> Dict:
-    return asdict(cfg)
-
-
 def _write_csv(path: str, rows: List[Dict]) -> None:
     if not rows:
         open(path, "w", encoding="utf-8").close()
@@ -536,8 +550,9 @@ def _write_csv(path: str, rows: List[Dict]) -> None:
         writer.writerows(rows)
 
 
-def train(cfg: Optional[TrainConfig] = None) -> IDDQNTrainer:
-    trainer = IDDQNTrainer(cfg or TrainConfig())
+def train(cfg: Optional[BMGTrainConfig] = None) -> BMGQTrainer:
+    """Entry point: build a trainer from ``cfg`` and run it."""
+    trainer = BMGQTrainer(cfg or BMGTrainConfig())
     trainer.train()
     return trainer
 

@@ -5,11 +5,30 @@ consume the per-driver observation dict from :class:`RidePoolEnv` and return a
 conflict-free ``{driver_id: {"orders": [...]}}`` action mapping (each pending
 order is bid on by at most one driver, satisfying the env's strict conflict
 rule).
+
+Pickup-distance gate (units / metric)
+-------------------------------------
+The matching COST (and greedy ordering) is always the true road-network pickup
+distance -- that is the definition of the nearest / Hungarian baselines and is
+never changed. The *gate* that decides whether a (driver, order) pair is even
+eligible, however, follows ``cfg.pickup_distance_metric`` so it is identical to
+the learning methods' gate, keeping the comparison fair:
+
+* ``"euclidean"`` (default): a pair is eligible iff the straight-line distance
+  (origin -> driver location), in KILOMETRES, is within the threshold. On the
+  abstract km scenarios coordinates are already km; on graph scenarios (osmnx /
+  nyc) coordinates are ``(lon, lat)`` degrees and are scaled to km with a
+  lat-linear correction ``(111*cos(lat0), 111)`` at the area-centre latitude.
+* ``"network"``: a pair is eligible iff the road-network distance is within the
+  threshold. ``network.distance`` returns metres on graph scenarios, so the km
+  threshold is scaled to metres there.
+
+The threshold itself (``cfg.pickup_distance_threshold``) is always in km.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -18,6 +37,32 @@ from benchmark.spatial import GridIndex
 
 Coord = Tuple[float, float]
 Area = Tuple[float, float, float, float]
+
+
+def _gate_params_from_cfg(cfg, area: Area):
+    """Derive the pickup-distance gate parameters from a BenchmarkConfig.
+
+    Returns ``(metric, coord_to_km, thr_network)`` where:
+
+    * ``metric`` is ``"euclidean"`` or ``"network"``;
+    * ``coord_to_km = (kx, ky)`` scales a coordinate delta to kilometres for the
+      Euclidean gate ((1, 1) on abstract scenarios; lat-linear on graph ones);
+    * ``thr_network`` is the threshold expressed in the ROAD-NETWORK metric's
+      units (metres on graph scenarios, km on abstract ones), or ``None`` when
+      the gate is disabled. Used only by the ``"network"`` metric.
+    """
+    metric = getattr(cfg, "pickup_distance_metric", "euclidean")
+    is_graph = cfg.network_kind in ("osmnx", "nyc")
+    if is_graph:
+        lat0 = 0.5 * (area[1] + area[3])
+        coord_to_km = (111.0 * float(np.cos(np.radians(lat0))), 111.0)
+    else:
+        coord_to_km = (1.0, 1.0)
+    thr_km = cfg.pickup_distance_threshold
+    thr_network = (
+        None if thr_km is None else thr_km * (1000.0 if is_graph else 1.0)
+    )
+    return metric, coord_to_km, thr_network
 
 
 class NearestDistanceDispatch:
@@ -33,48 +78,44 @@ class NearestDistanceDispatch:
        consuming each order once and decrementing driver free capacity. A
        driver may take several nearby orders while capacity allows (pooling).
     4. **Fallback pass**: any order left unassigned while free-capacity drivers
-       still remain is matched against those remaining drivers exactly. This
-       removes the artificial under-assignment that pure k-NN truncation could
-       otherwise cause; the residual set is typically small so this is cheap.
+       still remain is matched against those remaining drivers exactly.
 
     Bids are conflict-free by construction (each order committed at most once),
     so the environment never raises ConflictError.
+
+    The eligibility gate follows ``pickup_distance_metric`` (see module docstring)
+    while the greedy ordering / committed distance is always the road-network
+    pickup distance.
     """
 
     def __init__(
         self,
         network: RoadNetwork,
         area: Area,
-                cell_size: float = None,
+        cell_size: float = None,
         k_nearest: int = 20,
         use_knn: bool = True,
         max_orders_per_driver: int = 1,
+        pickup_distance_threshold: float = None,
+        pickup_distance_metric: str = "euclidean",
+        coord_to_km: Tuple[float, float] = (1.0, 1.0),
+        thr_network: Optional[float] = None,
     ):
         """
         Parameters
         ----------
-        network:
-            Road network used to measure pickup distance (order origin ->
-            driver location).
-        area:
-            Service-area bounds, needed to build the spatial index.
-        cell_size:
-            Grid cell side length in coordinate units. Defaults to one per-step
-            travel distance (``network.speed``), keeping the nearest free driver
-            within a few rings.
-        k_nearest:
-            Number of nearest free-capacity candidate drivers retrieved per
-            order in the fast pass. Larger values approach exact matching at
-            higher cost; the fallback pass guarantees no order is dropped while
-            capacity remains regardless of this value.
-        max_orders_per_driver:
-            Maximum number of orders a single driver may be assigned in ONE
-            step. Defaults to 1, making the greedy baseline one-to-one per step
-            (directly comparable to :class:`HungarianDispatch`); further pooling
-            then happens over subsequent steps as the env re-exposes the driver
-            with remaining capacity. Set higher (e.g. the driver capacity) to
-            allow multi-order pooling within a single step, still bounded by the
-            driver's free capacity. Must be >= 1.
+        pickup_distance_threshold:
+            Gate threshold in KILOMETRES (``None`` disables the gate).
+        pickup_distance_metric:
+            ``"euclidean"`` (default) or ``"network"`` -- which distance the gate
+            compares against (see module docstring). The matching cost is always
+            the road-network distance regardless of this.
+        coord_to_km:
+            ``(kx, ky)`` scaling a coordinate delta to km for the Euclidean gate.
+        thr_network:
+            Threshold pre-scaled to the road-network metric's units (metres on
+            graph scenarios), used only by the ``"network"`` gate. ``None``
+            disables the gate.
         """
         if max_orders_per_driver < 1:
             raise ValueError(
@@ -86,8 +127,12 @@ class NearestDistanceDispatch:
         self.k_nearest = int(k_nearest)
         self.use_knn = bool(use_knn)
         self.max_orders_per_driver = int(max_orders_per_driver)
+        self.pickup_distance_threshold = pickup_distance_threshold
+        self.pickup_distance_metric = pickup_distance_metric
+        self.coord_to_km = coord_to_km
+        self.thr_network = thr_network
         self._index = GridIndex(area, self.cell_size)
-        # {order_id: committed pickup distance (km)} for the recorder.
+        # {order_id: committed pickup distance} for the recorder.
         self.last_assignment_distances: Dict[int, float] = {}
 
     @classmethod
@@ -95,19 +140,43 @@ class NearestDistanceDispatch:
         """Build the dispatcher directly from a :class:`BenchmarkConfig`.
 
         Uses the same road network the benchmark env is built with, so pickup
-                distances are measured under the scenario's metric.
+        distances are measured under the scenario's metric. The gate metric and
+        threshold are read from ``cfg`` (km threshold; metric-aware gate).
         """
         from benchmark.config import _make_network
 
         network = _make_network(cfg)
         area = network.bounds if cfg.network_kind in ("osmnx", "nyc") else cfg.area
+        metric, coord_to_km, thr_network = _gate_params_from_cfg(cfg, area)
         return cls(
             network=network,
             area=area,
             k_nearest=k_nearest,
             use_knn=use_knn,
             max_orders_per_driver=max_orders_per_driver,
+            pickup_distance_threshold=cfg.pickup_distance_threshold,
+            pickup_distance_metric=metric,
+            coord_to_km=coord_to_km,
+            thr_network=thr_network,
         )
+
+    def _gate_ok(self, origin: Coord, driver_loc: Coord, d_network: float) -> bool:
+        """Whether a (order origin, driver location) pair passes the gate.
+
+        ``d_network`` is the already-computed road-network distance for the pair
+        (reused for the ``"network"`` metric so no extra graph query is paid).
+        """
+        thr_km = self.pickup_distance_threshold
+        if thr_km is None:
+            return True
+        if self.pickup_distance_metric == "network":
+            thr = self.thr_network if self.thr_network is not None else thr_km
+            return d_network <= thr
+        # Euclidean (straight-line) km distance with the coord->km scaling.
+        kx, ky = self.coord_to_km
+        dx = (origin[0] - driver_loc[0]) * kx
+        dy = (origin[1] - driver_loc[1]) * ky
+        return (dx * dx + dy * dy) <= (thr_km * thr_km)
 
     def act(self, observations: Dict[int, Dict]) -> Dict[int, Dict]:
         self.last_assignment_distances = {}
@@ -127,7 +196,7 @@ class NearestDistanceDispatch:
             free_cap[did] = s["capacity"] - s["onboard_passengers"]
             driver_loc[did] = s["location"]
 
-                # Build the spatial index over all drivers (cheap, O(drivers)).
+        # Build the spatial index over all drivers (cheap, O(drivers)).
         self._index.build(driver_loc)
         dist_fn = self.network.distance
         eff_k = self.k_nearest if self.use_knn else len(observations)
@@ -136,11 +205,6 @@ class NearestDistanceDispatch:
         origin_of: Dict[int, Coord] = {o["order_id"]: o["origin"] for o in pending}
         bids: Dict[int, List[int]] = {did: [] for did in observations}
         assigned_orders = set()
-        # Per-step cap on how many orders one driver may be assigned. This is an
-        # additional constraint ON TOP of capacity: even if a driver could fit
-        # more passengers, it accepts at most ``max_n`` orders this step (the
-        # remaining demand is served on later steps). ``len(bids[did])`` is the
-        # number already committed to that driver this step.
         max_n = self.max_orders_per_driver
 
         # --- Fast pass: k-NN candidate pairs, greedy by ascending distance. ---
@@ -160,6 +224,8 @@ class NearestDistanceDispatch:
         for d, oid, did in pairs:
             if oid in assigned_orders:
                 continue
+            if not self._gate_ok(origin_of[oid], driver_loc[did], d):
+                continue  # pickup distance gate: too far to serve
             if len(bids[did]) >= max_n:
                 continue  # driver already hit its per-step order cap
             party = party_of[oid]
@@ -172,8 +238,6 @@ class NearestDistanceDispatch:
 
         # --- Fallback pass: exact match for residual orders vs free drivers. ---
         residual_orders = [oid for oid in origin_of if oid not in assigned_orders]
-        # Eligible fallback drivers still have capacity AND room under the
-        # per-step order cap.
         free_drivers = [
             did
             for did, c in free_cap.items()
@@ -191,6 +255,8 @@ class NearestDistanceDispatch:
             for d, oid, did in fb_pairs:
                 if oid in assigned_orders:
                     continue
+                if not self._gate_ok(origin_of[oid], driver_loc[did], d):
+                    continue  # pickup distance gate: too far to serve
                 if len(bids[did]) >= max_n:
                     continue  # respect the per-step order cap in fallback too
                 party = party_of[oid]
@@ -207,22 +273,19 @@ class NearestDistanceDispatch:
 class HungarianDispatch:
     """Globally optimal (minimum total pickup distance) one-to-one matching.
 
-    Unlike :class:`NearestDistanceDispatch` (which commits greedily, closest
-    pair first), this solves the assignment problem exactly each step via
+    Solves the assignment problem exactly each step via
     ``scipy.optimize.linear_sum_assignment`` (Jonker-Volgenant), minimising the
-    **total** pickup distance over all matched (order, driver) pairs. It is the
-    natural optimal-matching counterpart of the greedy nearest baseline.
-
-    Design choices (kept directly comparable to the nearest baseline):
+    **total** road-network pickup distance over all matched pairs. The natural
+    optimal-matching counterpart of the greedy nearest baseline.
 
     * **One-to-one per step**: each free-capacity driver is matched to at most
-       one order this step; further pooling happens on subsequent steps. This
-       is the clean 'optimal bipartite matching' semantics.
+       one order this step; further pooling happens on subsequent steps.
     * **Candidate pruning**: the same :class:`GridIndex` k-NN candidate set is
-       used, so only nearby (order, driver) pairs enter the cost matrix. Non
-       candidate entries are set to a large sentinel cost (INF) and any match
-       landing on a sentinel is discarded, so an order with no free nearby
-       driver simply stays pending.
+       used. Non-candidate / gated-out entries are set to a large sentinel cost
+       (INF) and any match landing on a sentinel is discarded, so an order with
+       no free eligible driver simply stays pending.
+    * **Pickup-distance gate**: follows ``pickup_distance_metric`` exactly like
+       :class:`NearestDistanceDispatch`; gated-out pairs are left at INF.
 
     Resulting bids are conflict-free (each order matched at most once).
     """
@@ -233,33 +296,60 @@ class HungarianDispatch:
         self,
         network: RoadNetwork,
         area: Area,
-                cell_size: float = None,
+        cell_size: float = None,
         k_nearest: int = 20,
         use_knn: bool = True,
+        pickup_distance_threshold: float = None,
+        pickup_distance_metric: str = "euclidean",
+        coord_to_km: Tuple[float, float] = (1.0, 1.0),
+        thr_network: Optional[float] = None,
     ):
         """See :class:`NearestDistanceDispatch` for parameter meanings; the
-        candidate set is built identically for a fair comparison."""
+        candidate set and gate are built identically for a fair comparison."""
         self.network = network
         self.area = area
         self.cell_size = cell_size if cell_size else max(network.speed, 1e-6)
         self.k_nearest = int(k_nearest)
         self.use_knn = bool(use_knn)
+        self.pickup_distance_threshold = pickup_distance_threshold
+        self.pickup_distance_metric = pickup_distance_metric
+        self.coord_to_km = coord_to_km
+        self.thr_network = thr_network
         self._index = GridIndex(area, self.cell_size)
         self.last_assignment_distances: Dict[int, float] = {}
 
     @classmethod
     def from_config(cls, cfg, k_nearest: int = 20, use_knn: bool = True):
-        """Build directly from a :class:`BenchmarkConfig` (same metric as env)."""
+        """Build directly from a :class:`BenchmarkConfig` (same metric as env).
+        Gate metric and km threshold are read from ``cfg`` (metric-aware gate)."""
         from benchmark.config import _make_network
 
         network = _make_network(cfg)
         area = network.bounds if cfg.network_kind in ("osmnx", "nyc") else cfg.area
+        metric, coord_to_km, thr_network = _gate_params_from_cfg(cfg, area)
         return cls(
             network=network,
             area=area,
             k_nearest=k_nearest,
             use_knn=use_knn,
+            pickup_distance_threshold=cfg.pickup_distance_threshold,
+            pickup_distance_metric=metric,
+            coord_to_km=coord_to_km,
+            thr_network=thr_network,
         )
+
+    def _gate_ok(self, origin: Coord, driver_loc: Coord, d_network: float) -> bool:
+        """Whether a pair passes the gate (see NearestDistanceDispatch._gate_ok)."""
+        thr_km = self.pickup_distance_threshold
+        if thr_km is None:
+            return True
+        if self.pickup_distance_metric == "network":
+            thr = self.thr_network if self.thr_network is not None else thr_km
+            return d_network <= thr
+        kx, ky = self.coord_to_km
+        dx = (origin[0] - driver_loc[0]) * kx
+        dy = (origin[1] - driver_loc[1]) * ky
+        return (dx * dx + dy * dy) <= (thr_km * thr_km)
 
     def act(self, observations: Dict[int, Dict]) -> Dict[int, Dict]:
         from scipy.optimize import linear_sum_assignment
@@ -313,9 +403,14 @@ class HungarianDispatch:
         n_cols = len(driver_index)
 
         # Build the sparse cost matrix with INF sentinels for non-candidates.
+        # Pairs failing the (metric-aware) pickup gate are also left at INF so
+        # the solver never matches them (the order then stays pending).
         cost = np.full((n_rows, n_cols), self._INF, dtype=float)
         for i, oid in enumerate(order_ids):
+            origin = origin_of[oid]
             for did, d in cand[oid].items():
+                if not self._gate_ok(origin, driver_loc[did], d):
+                    continue
                 cost[i, col_of[did]] = d
 
         # Optimal one-to-one assignment minimising total pickup distance.
@@ -327,7 +422,6 @@ class HungarianDispatch:
                 continue  # sentinel: no real candidate -> order stays pending
             oid = order_ids[i]
             did = driver_index[j]
-            # Capacity is guaranteed by candidate_filter (party <= free_cap).
             bids[did].append(oid)
             self.last_assignment_distances[oid] = d
 

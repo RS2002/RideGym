@@ -21,6 +21,8 @@ from ridepool_sim.order_generator import (
     OrderGenerator,
     RandomOrderGenerator,
     DataFrameOrderGenerator,
+    NYCOrderGenerator,
+    MultiWindowNYCOrderGenerator,
 )
 from ridepool_sim.routing import RoutesPlanner, GreedyInsertionPlanner
 from ridepool_sim.rewards import RewardFunction, DefaultRewardFunction
@@ -43,6 +45,8 @@ __all__ = [
     "OrderGenerator",
     "RandomOrderGenerator",
     "DataFrameOrderGenerator",
+    "NYCOrderGenerator",
+    "MultiWindowNYCOrderGenerator",
     "RoutesPlanner",
     "GreedyInsertionPlanner",
     "RewardFunction",

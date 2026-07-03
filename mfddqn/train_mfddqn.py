@@ -1,13 +1,15 @@
-"""Formal IDDQN trainer.
+"""Formal MF-DDQN (Mean-Field Double DQN) trainer.
 
-End-to-end training loop for the Independent Double DQN with bipartite-matching
-agent on the standard ride-pooling benchmark scenario.
+Mirrors bmgq/train_bmgq.py and iddqn/train_iddqn.py (same BenchmarkConfig,
+collection/eval cadence, nearest+Hungarian baselines, CSV logging, checkpoints,
+and the held-out val/test split evaluation) so MF-DDQN, BMG-Q and IDDQN numbers
+are directly comparable. The methodological difference is the agent: every
+Q-value is conditioned on a per-driver mean action field, solved by a Hungarian
+fixed-point loop (see mfddqn.mean_field).
 
 Run:
 
-    python -m iddqn.train_iddqn
-
-All hyper-parameters are in :class:`TrainConfig`.
+    python -m mfddqn.train_mfddqn
 """
 
 from __future__ import annotations
@@ -28,64 +30,72 @@ from benchmark.baselines import NearestDistanceDispatch, HungarianDispatch
 from benchmark.runner import run_episode
 
 from iddqn.features import FeatureConfig, FeatureEncoder
-from iddqn.qnet import PairQNet
-from iddqn.inference import IDDQNActor
-from iddqn.assignment_net import AssignmentNet
-from iddqn.assignment_inference import AssignmentActor
 from iddqn.exploration import QNoiseExplorer, AnnealSchedule
-from iddqn.replay import StepSnapshot, ReplayBuffer
+from iddqn.replay import ReplayBuffer
 
-from iddqn.agent import IDDQNAgent, AssignmentAgent, IDDQNConfig
+from mfddqn.mf_qnet import MeanFieldPairQNet
+from mfddqn.mf_inference import MFDDQNActor
+from mfddqn.mf_agent import MFDDQNAgent, MFDDQNConfig
+from mfddqn.mf_replay import MFStepSnapshot
+from mfddqn.mean_field import MeanFieldConfig
 
 
 @dataclass
-class TrainConfig:
-    """IDDQN training hyper-parameters and run controls."""
+class MFTrainConfig:
+    """MF-DDQN training hyper-parameters. Shares every field with the IDDQN /
+    BMG-Q configs for parity; the mean-field additions are ``neighbours_k``,
+    ``mf_iters`` and ``simplified``."""
 
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
 
-    gamma: float = 0.9998
-    lr: float = 5e-4
+    # Optimisation / agent.
+    gamma: float = 0.99
+    lr: float = 1e-3
     batch_size: int = 8
-    tau: float = 0.005
+    tau: float = 0.01
     target_sync_every: int = 20
-    grad_clip: float = 1.0
+    grad_clip: float = 10.0
     hidden: tuple = (128, 128)
 
-    net_arch: str = "mlp"
-    embed_dim: int = 64
-    tf_heads: int = 4
-    max_seq_len: int = 6
+    # Mean-field specifics.
+    neighbours_k: int = 20
+    mf_iters: int = 2
+    simplified: bool = True
 
+    # Replay / schedule.
     replay_capacity: int = 6_000
     warmup_snapshots: int = 120
     updates_per_step: int = 1
 
+    # Episodes.
     num_episodes: int = 500
     eval_every: int = 10
     eval_baselines: bool = True
-    # Train/val/test split control (NYC multi-window scenarios). Periodic
-    # evaluation runs on eval_split (held-out "val"); a final evaluation after
-    # training runs on test_split ("test"). Ignored without a split pool.
+    # Train/val/test split control (NYC multi-window scenarios). Periodic eval
+    # runs on eval_split (held-out "val"); a final eval after training runs on
+    # test_split ("test"). Ignored without a split pool.
     eval_split: str = "val"
     test_split: str = "test"
     final_test: bool = True
 
+    # Exploration anneal.
     anneal_t0: float = 1.0
     anneal_mode: str = "exponential"
-    anneal_decay: float = 0.99
+    anneal_decay: float = 0.9995
     anneal_decay_steps: int = 20_000
-    anneal_t_min: float = 0.001
+    anneal_t_min: float = 0.0
     noise_coef: float = 1.0
     scale_stat: str = "std"
     scale_floor: float = 1e-3
 
+    # Candidate pruning (kept for parity; dense by default).
     use_knn: bool = False
     k_nearest: int = 20
 
+    # Infra.
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 0
-    out_dir: str = "iddqn/runs"
+    out_dir: str = "mfddqn/runs"
     run_name: Optional[str] = None
     save_every: int = 10
     save_eval_details: bool = True
@@ -93,16 +103,28 @@ class TrainConfig:
 
 
 class _GreedyActorDispatch:
-    """Adapts an :class:`IDDQNActor` to the benchmark ``act(observations)`` API."""
+    """Adapts an MFDDQNActor to the benchmark act(observations) API.
 
-    def __init__(self, actor: IDDQNActor, network):
+    Always greedy (explore_step=None). For the simplified mean-field variant the
+    carried-over a_bar is threaded across the episode's steps (reset per episode
+    via reset_episode()). Exposes last_assignment_distances for the recorder.
+    """
+
+    def __init__(self, actor: MFDDQNActor, network):
         self._actor = actor
         self._network = network
         self.last_assignment_distances: Dict[int, float] = {}
+        self._a_bar = None  # carried mean field (simplified variant)
+
+    def reset_episode(self) -> None:
+        self._a_bar = None
 
     def act(self, observations: Dict[int, Dict]) -> Dict[int, Dict]:
-        out = self._actor.act(observations, explore_step=None)
-        actions = out[0]
+        actions, _state, _nb, _triples, a_bar_out, _dbg = self._actor.act(
+            observations, explore_step=None, a_bar_in=self._a_bar
+        )
+        # Simplified variant carries a_bar across steps; full variant returns None.
+        self._a_bar = a_bar_out
         self.last_assignment_distances = {}
         if observations:
             for did, act in actions.items():
@@ -119,10 +141,10 @@ class _GreedyActorDispatch:
         return actions
 
 
-class IDDQNTrainer:
+class MFDDQNTrainer:
     """Owns the env, agent, replay buffer, explorer, and the run loop."""
 
-    def __init__(self, cfg: TrainConfig):
+    def __init__(self, cfg: MFTrainConfig):
         self.cfg = cfg
         bm = cfg.benchmark
 
@@ -154,46 +176,39 @@ class IDDQNTrainer:
             max_capacity=bm.driver_capacity,
             max_wait=bm.order_timeout or float(bm.horizon),
             horizon=bm.horizon,
-            max_seq_len=cfg.max_seq_len,
         )
         self.encoder = FeatureEncoder(self.fc)
 
-        self.net_arch = cfg.net_arch
-        agent_cfg = IDDQNConfig(
-            gamma=cfg.gamma,
-            lr=cfg.lr,
-            batch_size=cfg.batch_size,
-            tau=cfg.tau,
-            target_sync_every=cfg.target_sync_every,
-            grad_clip=cfg.grad_clip,
-            device=cfg.device,
-            # Idling rule for the Q-target's next-state action selection; must
-            # match the actor below so target and behaviour agree.
+        # Mean-field block width == order feature width.
+        mean_field_dim = self.fc.order_dim
+        self.mf_cfg = MeanFieldConfig(
+            neighbours_k=cfg.neighbours_k,
+            iters=cfg.mf_iters,
+            simplified=cfg.simplified,
+            # Shared by the actor and the agent's Q-target so idling behaviour
+            # is identical in acting and bootstrapping. False -> a driver takes
+            # no order only as a passive fallback.
             allow_idle=bm.allow_idle,
         )
-        if cfg.net_arch == "assignment":
-            net = AssignmentNet(
-                non_seq_dim=self.fc.non_seq_dim,
-                seq_token_dim=self.fc.seq_token_dim,
-                order_dim=self.fc.order_dim,
-                embed_dim=cfg.embed_dim,
-                tf_heads=cfg.tf_heads,
-            )
-            self.agent = AssignmentAgent(net, agent_cfg)
-        else:
-                self.agent = IDDQNAgent(
-                self.fc.pair_dim,
-                agent_cfg,
-                # Two-tower PairQNet: encode the driver half and the order half
-                # separately (split at driver_dim), then fuse. driver_dim is the
-                # concatenation split point every caller uses (driver first).
-                qnet=PairQNet(
-                    self.fc.pair_dim,
-                    hidden=cfg.hidden,
-                    driver_dim=self.fc.driver_dim,
-                    embed_dim=cfg.embed_dim,
-                ),
-            )
+
+        qnet = MeanFieldPairQNet(
+            self.fc.pair_dim, mean_field_dim, hidden=cfg.hidden
+        )
+        self.agent = MFDDQNAgent(
+            self.fc.pair_dim,
+            mean_field_dim,
+            MFDDQNConfig(
+                gamma=cfg.gamma,
+                lr=cfg.lr,
+                batch_size=cfg.batch_size,
+                tau=cfg.tau,
+                target_sync_every=cfg.target_sync_every,
+                grad_clip=cfg.grad_clip,
+                device=cfg.device,
+            ),
+            self.mf_cfg,
+            qnet=qnet,
+        )
 
         self.explorer = QNoiseExplorer(
             schedule=AnnealSchedule(
@@ -209,14 +224,12 @@ class IDDQNTrainer:
             rng=np.random.default_rng(cfg.seed),
         )
 
-        actor_cls = (
-            AssignmentActor if cfg.net_arch == "assignment" else IDDQNActor
-        )
-        self.actor = actor_cls(
+        self.actor = MFDDQNActor(
             self.agent.online,
             self.encoder,
             area,
             self.network.speed,
+            self.mf_cfg,
             k_nearest=cfg.k_nearest,
             use_knn=cfg.use_knn,
             device=cfg.device,
@@ -225,19 +238,16 @@ class IDDQNTrainer:
             distance_fn=(
                 self.network.distance
                 if bm.pickup_distance_metric == "network"
-                                else None
+                else None
             ),
             coord_to_km=self._coord_to_km,
             network_distance_is_metres=self._net_dist_metres,
-            # When False, a driver actively takes no order only as a passive
-            # fallback (assigned a legal order whenever one is available).
-            allow_idle=bm.allow_idle,
         )
 
         self.buffer = ReplayBuffer(cfg.replay_capacity)
         self.global_step = 0
 
-        run_name = cfg.run_name or time.strftime("iddqn_%Y%m%d_%H%M%S")
+        run_name = cfg.run_name or time.strftime("mfddqn_%Y%m%d_%H%M%S")
         self.run_dir = os.path.join(cfg.out_dir, run_name)
         os.makedirs(self.run_dir, exist_ok=True)
         self.ckpt_dir = os.path.join(self.run_dir, "checkpoints")
@@ -249,15 +259,13 @@ class IDDQNTrainer:
         self._train_rows: List[Dict] = []
         self._eval_rows: List[Dict] = []
 
-        with open(os.path.join(self.run_dir, "config.json"), "w", encoding="utf-8") as f:
-            json.dump(_config_to_jsonable(cfg), f, indent=2)
+        with open(
+            os.path.join(self.run_dir, "config.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump(asdict(cfg), f, indent=2)
 
-        # Per-split baseline caches (val baselines differ from test baselines).
+        # Per-split baseline caches (val vs test draw different windows).
         self._baseline_cache: Dict[str, Dict[str, Dict]] = {}
-
-        # Pre-build eval benchmark configs. With a split pool, val/test draw
-        # from their own held-out window pools via nyc_split. Without one these
-        # are just the training benchmark (single-file replay).
         self._uses_splits = getattr(bm, "nyc_splits_dir", None) is not None
         if self._uses_splits:
             self._eval_bm = dataclasses.replace(bm, nyc_split=cfg.eval_split)
@@ -266,17 +274,9 @@ class IDDQNTrainer:
             self._eval_bm = bm
             self._test_bm = bm
 
-    def _make_snapshot(self, prev, next_state, done: bool) -> StepSnapshot:
-        state, act_data, rvec = prev
-        if self.net_arch == "assignment":
-            aof, adummy = act_data
-            return StepSnapshot(
-                state, None, rvec, next_state, done,
-                action_order_feats=aof, action_is_dummy=adummy,
-            )
-        return StepSnapshot(state, act_data, rvec, next_state, done)
-
+    # --------------------------------------------------------------- collect
     def collect_episode(self, episode: int = 0) -> Dict:
+        """Run one behaviour-policy episode, push snapshots, and train."""
         cfg = self.cfg
         # Per-episode reset seed so train-mode window sampling AND random
         # party sizes vary across episodes, while staying reproducible for a
@@ -286,20 +286,15 @@ class IDDQNTrainer:
         losses: List[float] = []
         ep_reward = 0.0
         steps = 0
+        # prev = (state, neighbours, action_triple_feats, a_bar_out, reward_vec)
+        # of the PREVIOUS step.
         prev = None
+        a_bar_in = None  # simplified variant: carried mean field
 
-        assignment = self.net_arch == "assignment"
         while True:
-            if assignment:
-                actions, state, aof, adummy, _dbg = self.actor.act(
-                    obs, explore_step=self.global_step
-                )
-                act_data = (aof, adummy)
-            else:
-                actions, state, apf, _dbg = self.actor.act(
-                    obs, explore_step=self.global_step
-                )
-                act_data = apf
+            actions, state, neighbours, triples, a_bar_out, _dbg = self.actor.act(
+                obs, explore_step=self.global_step, a_bar_in=a_bar_in
+            )
             nobs, rew, dones, _info = self.env.step(actions)
 
             rvec = np.array([rew[d] for d in obs.keys()], dtype=np.float32)
@@ -307,8 +302,22 @@ class IDDQNTrainer:
 
             done = dones["__all__"]
             if prev is not None:
-                self.buffer.push(self._make_snapshot(prev, state, False))
-            prev = (state, act_data, rvec)
+                p_state, p_nb, p_triples, p_abar_out, p_rvec = prev
+                self.buffer.push(
+                    MFStepSnapshot(
+                        state=p_state,
+                        action_triple_feats=p_triples,
+                        rewards=p_rvec,
+                        next_state=state,
+                        next_state_neighbours=(
+                            None if cfg.simplified else neighbours
+                        ),
+                        done=False,
+                        a_bar_out=(p_abar_out if cfg.simplified else None),
+                    )
+                )
+            prev = (state, neighbours, triples, a_bar_out, rvec)
+            a_bar_in = a_bar_out  # carry for simplified variant (None if full)
 
             if self.buffer.can_sample(cfg.batch_size) and (
                 len(self.buffer) >= cfg.warmup_snapshots
@@ -322,7 +331,20 @@ class IDDQNTrainer:
             steps += 1
 
             if done:
-                self.buffer.push(self._make_snapshot(prev, state, True))
+                p_state, p_nb, p_triples, p_abar_out, p_rvec = prev
+                self.buffer.push(
+                    MFStepSnapshot(
+                        state=p_state,
+                        action_triple_feats=p_triples,
+                        rewards=p_rvec,
+                        next_state=state,
+                        next_state_neighbours=(
+                            None if cfg.simplified else neighbours
+                        ),
+                        done=True,
+                        a_bar_out=(p_abar_out if cfg.simplified else None),
+                    )
+                )
                 break
 
         return {
@@ -334,18 +356,20 @@ class IDDQNTrainer:
             "replay_size": len(self.buffer),
         }
 
+    # --------------------------------------------------------------- evaluate
     def evaluate(self, episode: int, split: Optional[str] = None) -> Dict:
-        """Greedy evaluation on a given split (val by default, or test)."""
+        """Greedy evaluation on a split (val by default, or test)."""
         cfg = self.cfg
         split = split or cfg.eval_split
         is_test = split == cfg.test_split
         eval_bm = self._test_bm if is_test else self._eval_bm
         tag = "test" if is_test else "val"
         dispatch = _GreedyActorDispatch(self.actor, self.network)
+        dispatch.reset_episode()
         eval_out = self.eval_details_dir if cfg.save_eval_details else None
         summary, _rec = run_episode(
             dispatch,
-            algorithm_name=f"iddqn_{tag}_ep{episode:04d}",
+            algorithm_name=f"mfddqn_{tag}_ep{episode:04d}",
             cfg=eval_bm,
             out_dir=eval_out,
             verbose=False,
@@ -406,7 +430,7 @@ class IDDQNTrainer:
         return out
 
     @staticmethod
-    def _print_eval_table(episode: int, tag: str, iddqn: Dict, baselines: Dict[str, Dict]):
+    def _print_eval_table(episode: int, tag: str, mfddqn: Dict, baselines: Dict[str, Dict]):
         cols = [
             ("total_reward", "reward"),
             ("service_rate", "service"),
@@ -434,13 +458,14 @@ class IDDQNTrainer:
                     cells.append(f"{s[k]:>10.4f}")
             print(f"{name:12s}" + "".join(cells))
 
-        _line("iddqn", iddqn)
+        _line("mfddqn", mfddqn)
         for name, s in baselines.items():
             _line(name, s)
         print()
 
+    # --------------------------------------------------------------- checkpoint
     def save_checkpoint(self, episode: int) -> str:
-        path = os.path.join(self.ckpt_dir, f"iddqn_ep{episode}.pt")
+        path = os.path.join(self.ckpt_dir, f"mfddqn_ep{episode}.pt")
         torch.save(
             {
                 "episode": episode,
@@ -448,8 +473,8 @@ class IDDQNTrainer:
                 "online": self.agent.online.state_dict(),
                 "target": self.agent.target.state_dict(),
                 "optim": self.agent.optim.state_dict(),
-                "net_arch": self.net_arch,
                 "pair_dim": self.fc.pair_dim,
+                "order_dim": self.fc.order_dim,
             },
             path,
         )
@@ -462,6 +487,7 @@ class IDDQNTrainer:
         self.agent.optim.load_state_dict(ckpt["optim"])
         self.global_step = ckpt.get("global_step", 0)
 
+    # --------------------------------------------------------------- main loop
     def train(self) -> None:
         cfg = self.cfg
         self.env.reset(seed=cfg.benchmark.seed)
@@ -473,8 +499,10 @@ class IDDQNTrainer:
                 else f"{cfg.benchmark.num_orders}"
             )
             print(
-                f"IDDQN training: {cfg.num_episodes} episodes, "
+                f"MF-DDQN training: {cfg.num_episodes} episodes, "
                 f"device={cfg.device}, pair_dim={self.fc.pair_dim}, "
+                f"order_dim={self.fc.order_dim}, K={cfg.neighbours_k}, "
+                f"mf_iters={cfg.mf_iters}, simplified={cfg.simplified}, "
                 f"network={cfg.benchmark.network_kind}, "
                 f"drivers={cfg.benchmark.num_drivers}, "
                 f"orders={order_src}, use_knn={cfg.use_knn}"
@@ -521,10 +549,6 @@ class IDDQNTrainer:
             print(f"\nDONE in {time.time() - t_run:.1f}s. Logs in {self.run_dir}")
 
 
-def _config_to_jsonable(cfg: TrainConfig) -> Dict:
-    return asdict(cfg)
-
-
 def _write_csv(path: str, rows: List[Dict]) -> None:
     if not rows:
         open(path, "w", encoding="utf-8").close()
@@ -536,8 +560,9 @@ def _write_csv(path: str, rows: List[Dict]) -> None:
         writer.writerows(rows)
 
 
-def train(cfg: Optional[TrainConfig] = None) -> IDDQNTrainer:
-    trainer = IDDQNTrainer(cfg or TrainConfig())
+def train(cfg: Optional[MFTrainConfig] = None) -> MFDDQNTrainer:
+    """Entry point: build a trainer from cfg and run it."""
+    trainer = MFDDQNTrainer(cfg or MFTrainConfig())
     trainer.train()
     return trainer
 

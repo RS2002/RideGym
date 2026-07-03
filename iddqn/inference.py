@@ -15,7 +15,7 @@ directly on stored action pair features -- it must NOT go through this function.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -75,10 +75,20 @@ class IDDQNActor:
         use_knn: bool = False,
         device: str = "cpu",
         explorer: Optional[QNoiseExplorer] = None,
+        pickup_distance_threshold: Optional[float] = None,
+        distance_fn: Optional[Callable[[Coord, Coord], float]] = None,
+        coord_to_km: Tuple[float, float] = (1.0, 1.0),
+        network_distance_is_metres: bool = False,
+        allow_idle: bool = True,
     ):
         """
         Parameters
         ----------
+        pickup_distance_threshold:
+            If set, a driver may only be matched to an order whose pickup
+            distance is within this threshold (coordinate units). ``None``
+            disables the gate. ``distance_fn`` supplies the metric (defaults to
+            Euclidean); pass ``network.distance`` for the true pickup distance.
         use_knn:
             Whether to prune the candidate (driver, order) set to each order's k
             nearest drivers before matching. Defaults to ``False`` (dense,
@@ -97,6 +107,14 @@ class IDDQNActor:
         self.cell_size = max(network_speed, 1e-6)
         self._index = GridIndex(area, self.cell_size)
         self.explorer = explorer
+        self.pickup_distance_threshold = pickup_distance_threshold
+        self.distance_fn = distance_fn
+        self.coord_to_km = coord_to_km
+        self.network_distance_is_metres = network_distance_is_metres
+        # Whether a driver may actively pick the no-order (dummy) action when a
+        # legal order is available. False -> idling is only a passive fallback
+        # (a driver is assigned an order whenever one is legally available).
+        self.allow_idle = bool(allow_idle)
 
     def act(
         self,
@@ -135,6 +153,10 @@ class IDDQNActor:
             index=self._index,
             k_nearest=self.k_nearest,
             use_knn=self.use_knn,
+            pickup_distance_threshold=self.pickup_distance_threshold,
+            distance_fn=self.distance_fn,
+            coord_to_km=self.coord_to_km,
+            network_distance_is_metres=self.network_distance_is_metres,
         )
         n = state.n_drivers
         m = state.n_orders
@@ -148,7 +170,9 @@ class IDDQNActor:
                 q_real, q_dummy, state.legal_mask, explore_step
             )
 
-        chosen_col, _ = match_drivers_to_orders(q_real, q_dummy, state.legal_mask)
+        chosen_col, _ = match_drivers_to_orders(
+            q_real, q_dummy, state.legal_mask, allow_idle=self.allow_idle
+        )
 
         actions: Dict[int, Dict] = {}
         pair_dim = state.driver_feats.shape[1] + state.dummy_feat.shape[0]
