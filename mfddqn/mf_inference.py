@@ -30,6 +30,7 @@ from mfddqn.mean_field import (
     mean_field_solve,
     mean_field_solve_simplified,
     build_neighbour_lists,
+    build_neighbour_lists_radius,
 )
 
 Coord = Tuple[float, float]
@@ -130,13 +131,23 @@ class MFDDQNActor:
         n = state.n_drivers
         m = state.n_orders
 
-        # Top-K spatial neighbour lists (computed once; reused every iteration).
+                # Spatial neighbour lists (computed once; reused every iteration). The
+        # neighbourhood is either top-K nearest ("knn") or every driver within a
+        # km radius ("radius"), per the mean-field config.
         driver_locs = [
             observations[d]["self"]["location"] for d in driver_ids
         ]
-        neighbours = build_neighbour_lists(
-            driver_locs, self._index, self.mf_cfg.neighbours_k
-        )
+        if self.mf_cfg.neighbour_mode == "radius":
+            neighbours = build_neighbour_lists_radius(
+                driver_locs,
+                self._index,
+                self.mf_cfg.neighbour_radius_km,
+                self.mf_cfg.coord_to_km,
+            )
+        else:
+            neighbours = build_neighbour_lists(
+                driver_locs, self._index, self.mf_cfg.neighbours_k
+            )
 
         if self.mf_cfg.simplified:
             # Use the previous step's mean field (zeros at the first step) and a

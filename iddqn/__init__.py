@@ -10,12 +10,20 @@ that independent per-driver greedy max would cause under action conflicts.
 
 from iddqn.features import FeatureConfig, FeatureEncoder
 from iddqn.qnet import PairQNet
+from iddqn.cv_qnet import (
+    CVNet,
+    MultiScaleGridEmbedding,
+    MultiScaleHexEmbedding,
+)
 from iddqn.matching import match_drivers_to_orders, build_legal_mask
 
 __all__ = [
     "FeatureConfig",
     "FeatureEncoder",
     "PairQNet",
+    "CVNet",
+    "MultiScaleGridEmbedding",
+    "MultiScaleHexEmbedding",
     "match_drivers_to_orders",
     "build_legal_mask",
 ]

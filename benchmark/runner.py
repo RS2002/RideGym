@@ -41,8 +41,14 @@ def run_episode(
     env = make_benchmark_env(cfg)
     recorder = EpisodeRecorder(algorithm=algorithm_name, config=cfg.to_dict())
 
-    obs, _ = env.reset(seed=cfg.seed)
+    # Timing contract: the reported model runtime spans from the FIRST reset()
+    # to the LAST step(), and deliberately EXCLUDES environment construction
+    # (make_benchmark_env above -- graph loading, matrix precompute, etc.),
+    # which is a one-off setup cost, not part of the method's per-episode
+    # dispatch time. Starting the clock immediately before reset() therefore
+    # measures exactly the reset + full act/step loop.
     t0 = time.time()
+    obs, _ = env.reset(seed=cfg.seed)
     step = 0
     while True:
         actions = algorithm.act(obs)
@@ -63,8 +69,10 @@ def run_episode(
         if dones["__all__"]:
             break
 
-    summary = recorder.finalize(env)
+    # Stop the clock at the last step (before finalize / KPI aggregation, which
+    # is bookkeeping, not model runtime).
     elapsed = time.time() - t0
+    summary = recorder.finalize(env)
     summary["wall_time_seconds"] = elapsed
 
     if verbose:

@@ -1,6 +1,6 @@
 """Real road-network backend backed by a cached OSMnx graph (constant speed).
 
-Implements the :class:`~ridepool_sim.road_network.RoadNetwork` interface on top
+Implements the :class:`~ride_gym.road_network.RoadNetwork` interface on top
 of a real OpenStreetMap drive network (downloaded and cached by
 ``data/build_network.py``). **Distances** follow the actual street topology
 (real detours, one-way streets, etc.); **travel time** uses a single constant
@@ -40,7 +40,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import networkx as nx
 
-from ridepool_sim.road_network import RoadNetwork, PathResult
+from ride_gym.road_network import RoadNetwork, PathResult
 
 Coord = Tuple[float, float]  # (lon, lat)
 

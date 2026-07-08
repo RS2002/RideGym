@@ -32,7 +32,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ridepool_sim.road_network import RoadNetwork
+from ride_gym.road_network import RoadNetwork
 from benchmark.spatial import GridIndex
 
 Coord = Tuple[float, float]
@@ -424,5 +424,469 @@ class HungarianDispatch:
             did = driver_index[j]
             bids[did].append(oid)
             self.last_assignment_distances[oid] = d
+
+        return {did: {"orders": oids} for did, oids in bids.items()}
+
+
+class RandomRadiusDispatch:
+    """Random (order, driver) matching within a fixed pickup radius.
+
+    The simplest model-based baseline: instead of preferring the *nearest* free
+    driver like :class:`NearestDistanceDispatch`, each pending order is matched
+    to a RANDOM eligible driver among those within the pickup radius. It shares
+    every fairness-relevant mechanism with the nearest baseline -- the same grid
+    index, the same metric-aware pickup gate, the same capacity handling, the
+    same conflict-free-by-construction guarantee, and the same
+    ``max_orders_per_driver`` control over whether a driver may take several
+    orders in one step (pooling) -- so the ONLY difference is *how* an eligible
+    (order, driver) pair is chosen: uniformly at random rather than by ascending
+    distance.
+
+    Radius (units)
+    --------------
+    The matching radius is exactly the pickup-distance gate: a pair is eligible
+    iff its pickup distance (order origin -> driver location) is within the
+    threshold, measured under ``pickup_distance_metric`` (see module docstring).
+    Unlike the nearest / Hungarian baselines (whose gate defaults to *disabled*),
+    this baseline's radius defaults to **1 km**, because "random within a radius"
+    is only meaningful with a bounded neighbourhood. Pass an explicit
+    ``pickup_distance_threshold`` (km) to widen / tighten it, or ``None`` to
+    disable the radius entirely (random over ALL free drivers).
+
+    Determinism
+    -----------
+    A ``seed`` makes the random matching reproducible across runs; the same seed
+    + same scenario yields the same assignments.
+
+    Bids are conflict-free by construction (each order committed at most once),
+    so the environment never raises ConflictError.
+    """
+
+    # Default matching radius (km) when the config leaves the gate unset. Random
+    # matching needs a bounded neighbourhood to be meaningful.
+    DEFAULT_RADIUS_KM = 1.0
+
+    def __init__(
+        self,
+        network: RoadNetwork,
+        area: Area,
+        cell_size: float = None,
+        k_nearest: int = 20,
+        use_knn: bool = True,
+        max_orders_per_driver: int = 1,
+        pickup_distance_threshold: float = None,
+        pickup_distance_metric: str = "euclidean",
+        coord_to_km: Tuple[float, float] = (1.0, 1.0),
+        thr_network: Optional[float] = None,
+        seed: Optional[int] = None,
+    ):
+        """
+        Parameters
+        ----------
+        pickup_distance_threshold:
+            Matching radius in KILOMETRES. ``None`` disables the radius (random
+            over all free drivers). See :class:`NearestDistanceDispatch` for the
+            gate-metric parameters, which are identical here.
+        max_orders_per_driver:
+            Max orders a single driver may take in one step (pooling). ``1``
+            (default) is one-order-per-step, matching the nearest baseline's
+            default; a larger value lets a driver be randomly matched to several
+            in-radius orders while capacity allows.
+        seed:
+            RNG seed for the random matching (reproducibility).
+        """
+        if max_orders_per_driver < 1:
+            raise ValueError(
+                f"max_orders_per_driver must be >= 1, got {max_orders_per_driver}"
+            )
+        self.network = network
+        self.area = area
+        self.cell_size = cell_size if cell_size else max(network.speed, 1e-6)
+        self.k_nearest = int(k_nearest)
+        self.use_knn = bool(use_knn)
+        self.max_orders_per_driver = int(max_orders_per_driver)
+        self.pickup_distance_threshold = pickup_distance_threshold
+        self.pickup_distance_metric = pickup_distance_metric
+        self.coord_to_km = coord_to_km
+        self.thr_network = thr_network
+        self._index = GridIndex(area, self.cell_size)
+        self._rng = np.random.default_rng(seed)
+        # {order_id: committed pickup distance} for the recorder.
+        self.last_assignment_distances: Dict[int, float] = {}
+
+    @classmethod
+    def from_config(
+        cls,
+        cfg,
+        k_nearest: int = 20,
+        use_knn: bool = True,
+        max_orders_per_driver: int = 1,
+        seed: Optional[int] = None,
+    ):
+        """Build the dispatcher directly from a :class:`BenchmarkConfig`.
+
+        Uses the same road network / gate metric as the benchmark env. The
+        matching radius is ``cfg.pickup_distance_threshold`` when set, else the
+        class default (:attr:`DEFAULT_RADIUS_KM`, 1 km) -- so this baseline
+        always matches within a bounded neighbourhood unless the config
+        explicitly requests an unbounded random match (use ``None`` in code for
+        unbounded). The ``seed`` defaults to the scenario seed for
+        reproducibility.
+        """
+        from benchmark.config import _make_network
+
+        network = _make_network(cfg)
+        area = network.bounds if cfg.network_kind in ("osmnx", "nyc") else cfg.area
+        metric, coord_to_km, _thr_network = _gate_params_from_cfg(cfg, area)
+        # Radius: config threshold if given, else the 1 km default. Re-derive
+        # thr_network for THIS radius (the config helper only scales the config
+        # threshold, which may be None here).
+        thr_km = cfg.pickup_distance_threshold
+        if thr_km is None:
+            thr_km = cls.DEFAULT_RADIUS_KM
+        is_graph = cfg.network_kind in ("osmnx", "nyc")
+        thr_network = thr_km * (1000.0 if is_graph else 1.0)
+        return cls(
+            network=network,
+            area=area,
+            k_nearest=k_nearest,
+            use_knn=use_knn,
+            max_orders_per_driver=max_orders_per_driver,
+            pickup_distance_threshold=thr_km,
+            pickup_distance_metric=metric,
+            coord_to_km=coord_to_km,
+            thr_network=thr_network,
+            seed=cfg.seed if seed is None else seed,
+        )
+
+    def _gate_ok(self, origin: Coord, driver_loc: Coord, d_network: float) -> bool:
+        """Whether a pair is within the matching radius (see NearestDistanceDispatch)."""
+        thr_km = self.pickup_distance_threshold
+        if thr_km is None:
+            return True
+        if self.pickup_distance_metric == "network":
+            thr = self.thr_network if self.thr_network is not None else thr_km
+            return d_network <= thr
+        kx, ky = self.coord_to_km
+        dx = (origin[0] - driver_loc[0]) * kx
+        dy = (origin[1] - driver_loc[1]) * ky
+        return (dx * dx + dy * dy) <= (thr_km * thr_km)
+
+    def act(self, observations: Dict[int, Dict]) -> Dict[int, Dict]:
+        self.last_assignment_distances = {}
+        if not observations:
+            return {}
+
+        any_obs = next(iter(observations.values()))
+        pending = any_obs["pending_orders"]
+        if not pending:
+            return {did: {"orders": []} for did in observations}
+
+        free_cap: Dict[int, int] = {}
+        driver_loc: Dict[int, Coord] = {}
+        for did, obs in observations.items():
+            s = obs["self"]
+            free_cap[did] = s["capacity"] - s["onboard_passengers"]
+            driver_loc[did] = s["location"]
+
+        self._index.build(driver_loc)
+        dist_fn = self.network.distance
+        eff_k = self.k_nearest if self.use_knn else len(observations)
+
+        party_of: Dict[int, int] = {o["order_id"]: o["num_passengers"] for o in pending}
+        origin_of: Dict[int, Coord] = {o["order_id"]: o["origin"] for o in pending}
+        bids: Dict[int, List[int]] = {did: [] for did in observations}
+        assigned_orders = set()
+        max_n = self.max_orders_per_driver
+
+        # Collect every in-radius, capacity-feasible (order, driver) pair. The
+        # grid index yields each order's nearest free drivers as a candidate
+        # set (cheap); the gate then keeps only those within the radius. The
+        # committed distance is kept for the recorder, but -- unlike the nearest
+        # baseline -- it is NOT used to order the commits.
+        pairs: List[Tuple[int, int, float]] = []  # (order_id, driver_id, distance)
+        for oid, origin in origin_of.items():
+            party = party_of[oid]
+            nearest = self._index.nearest(
+                origin,
+                eff_k,
+                distance_fn=dist_fn,
+                candidate_filter=lambda d, p=party: free_cap[d] >= p,
+            )
+            for d, did in nearest:
+                if self._gate_ok(origin, driver_loc[did], d):
+                    pairs.append((oid, did, d))
+
+        # Random matching: shuffle all eligible pairs, then commit greedily in
+        # that random order under the conflict / capacity / per-driver-cap rules.
+        # Shuffling the pair list (rather than picking a random driver per order
+        # independently) keeps every commit conflict-free while giving each
+        # eligible pair an unbiased chance.
+        self._rng.shuffle(pairs)
+        for oid, did, d in pairs:
+            if oid in assigned_orders:
+                continue  # order already taken
+            if len(bids[did]) >= max_n:
+                continue  # driver hit its per-step order cap
+            party = party_of[oid]
+            if free_cap[did] < party:
+                continue  # not enough remaining capacity
+            bids[did].append(oid)
+            free_cap[did] -= party
+            assigned_orders.add(oid)
+            self.last_assignment_distances[oid] = d
+
+        return {did: {"orders": oids} for did, oids in bids.items()}
+
+
+class GaleShapleyDispatch:
+    """Gale-Shapley (deferred-acceptance) stable matching dispatcher.
+
+    An online stable-matching baseline in the spirit of the assignment engine
+    used at Didi (see Gale & Shapley 1962; Yue et al. 2024). Each decision step
+    runs the deferred-acceptance algorithm between the pending orders and the
+    free-capacity drivers, using the two-sided preferences below, and commits
+    the resulting stable matching.
+
+    Two-sided preferences
+    ---------------------
+    * **Orders propose to drivers** (order-optimal stable matching), so the
+      result is the stable matching most preferred by the riders -- consistent
+      with a platform that prioritises rider waiting time.
+    * **An order prefers the CLOSEST driver** (ascending pickup distance): the
+      nearer the driver, the shorter the rider's expected waiting time, so the
+      order's preference list over drivers is sorted by ascending road-network
+      pickup distance.
+    * **A driver prefers the HIGHER-PRICED order** (descending price): a
+      driver's earnings scale with the order's fare, so it prefers the order
+      that pays most. The price is taken proportional to the trip distance
+      (origin -> destination, road-network) times the passenger count::
+
+          price(order) = trip_distance_km * num_passengers
+
+      matching the paper's "price proportional to distance and passenger
+      count". Ties are broken by ascending pickup distance (a closer rider is
+      preferred at equal price), then by order id for determinism.
+
+    Shared mechanisms (fair comparison)
+    -----------------------------------
+    Like the other baselines it uses the same :class:`GridIndex` k-NN candidate
+    set, the same metric-aware pickup gate, the same capacity handling, and the
+    same ``max_orders_per_driver`` control (a driver holds up to that many
+    orders, keeping its most-preferred proposals and rejecting the rest while
+    capacity allows). Bids are conflict-free by construction (deferred
+    acceptance never double-books an order), so the env never raises
+    ConflictError.
+    """
+
+    def __init__(
+        self,
+        network: RoadNetwork,
+        area: Area,
+        cell_size: float = None,
+        k_nearest: int = 20,
+        use_knn: bool = True,
+        max_orders_per_driver: int = 1,
+        pickup_distance_threshold: float = None,
+        pickup_distance_metric: str = "euclidean",
+        coord_to_km: Tuple[float, float] = (1.0, 1.0),
+        thr_network: Optional[float] = None,
+    ):
+        """See :class:`NearestDistanceDispatch` for the shared parameters.
+
+        Parameters
+        ----------
+        max_orders_per_driver:
+            Number of orders a driver may hold simultaneously in the stable
+            matching (its "quota"). ``1`` (default) is classic one-to-one
+            deferred acceptance; a larger quota lets a driver hold several of
+            its top-preferred in-radius orders while capacity allows (pooling).
+        """
+        if max_orders_per_driver < 1:
+            raise ValueError(
+                f"max_orders_per_driver must be >= 1, got {max_orders_per_driver}"
+            )
+        self.network = network
+        self.area = area
+        self.cell_size = cell_size if cell_size else max(network.speed, 1e-6)
+        self.k_nearest = int(k_nearest)
+        self.use_knn = bool(use_knn)
+        self.max_orders_per_driver = int(max_orders_per_driver)
+        self.pickup_distance_threshold = pickup_distance_threshold
+        self.pickup_distance_metric = pickup_distance_metric
+        self.coord_to_km = coord_to_km
+        self.thr_network = thr_network
+        self._index = GridIndex(area, self.cell_size)
+        # {order_id: committed pickup distance} for the recorder.
+        self.last_assignment_distances: Dict[int, float] = {}
+
+    @classmethod
+    def from_config(cls, cfg, k_nearest: int = 20, use_knn: bool = True, max_orders_per_driver: int = 1):
+        """Build directly from a :class:`BenchmarkConfig` (same metric as env).
+        Gate metric and km threshold are read from ``cfg`` (metric-aware gate)."""
+        from benchmark.config import _make_network
+
+        network = _make_network(cfg)
+        area = network.bounds if cfg.network_kind in ("osmnx", "nyc") else cfg.area
+        metric, coord_to_km, thr_network = _gate_params_from_cfg(cfg, area)
+        return cls(
+            network=network,
+            area=area,
+            k_nearest=k_nearest,
+            use_knn=use_knn,
+            max_orders_per_driver=max_orders_per_driver,
+            pickup_distance_threshold=cfg.pickup_distance_threshold,
+            pickup_distance_metric=metric,
+            coord_to_km=coord_to_km,
+            thr_network=thr_network,
+        )
+
+    def _gate_ok(self, origin: Coord, driver_loc: Coord, d_network: float) -> bool:
+        """Whether a pair passes the gate (see NearestDistanceDispatch._gate_ok)."""
+        thr_km = self.pickup_distance_threshold
+        if thr_km is None:
+            return True
+        if self.pickup_distance_metric == "network":
+            thr = self.thr_network if self.thr_network is not None else thr_km
+            return d_network <= thr
+        kx, ky = self.coord_to_km
+        dx = (origin[0] - driver_loc[0]) * kx
+        dy = (origin[1] - driver_loc[1]) * ky
+        return (dx * dx + dy * dy) <= (thr_km * thr_km)
+
+    def act(self, observations: Dict[int, Dict]) -> Dict[int, Dict]:
+        self.last_assignment_distances = {}
+        if not observations:
+            return {}
+
+        any_obs = next(iter(observations.values()))
+        pending = any_obs["pending_orders"]
+        if not pending:
+            return {did: {"orders": []} for did in observations}
+
+        free_cap: Dict[int, int] = {}
+        driver_loc: Dict[int, Coord] = {}
+        for did, obs in observations.items():
+            s = obs["self"]
+            free_cap[did] = s["capacity"] - s["onboard_passengers"]
+            driver_loc[did] = s["location"]
+
+        self._index.build(driver_loc)
+        dist_fn = self.network.distance
+        eff_k = self.k_nearest if self.use_knn else len(observations)
+
+        party_of: Dict[int, int] = {o["order_id"]: o["num_passengers"] for o in pending}
+        origin_of: Dict[int, Coord] = {o["order_id"]: o["origin"] for o in pending}
+        dest_of: Dict[int, Coord] = {o["order_id"]: o["destination"] for o in pending}
+
+        # Order fare / price = trip_distance * party (proportional to distance
+        # and passenger count). Higher price is more preferred by drivers.
+        price_of: Dict[int, float] = {}
+        for oid in origin_of:
+            trip = dist_fn(origin_of[oid], dest_of[oid])
+            price_of[oid] = trip * party_of[oid]
+
+        # --- Build each order's preference list over drivers ---------------
+        # Candidate drivers come from the shared k-NN + gate; the order prefers
+        # the CLOSEST driver first (ascending pickup distance -> shortest wait).
+        # ``pref[oid]`` is a list of (driver_id, pickup_distance) sorted by
+        # ascending distance; ``pickup[(oid, did)]`` caches the distance.
+        pref: Dict[int, List[Tuple[int, float]]] = {}
+        pickup: Dict[Tuple[int, int], float] = {}
+        for oid, origin in origin_of.items():
+            party = party_of[oid]
+            nearest = self._index.nearest(
+                origin,
+                eff_k,
+                distance_fn=dist_fn,
+                candidate_filter=lambda d, p=party: free_cap[d] >= p,
+            )
+            cand: List[Tuple[int, float]] = []
+            for d, did in nearest:
+                if not self._gate_ok(origin, driver_loc[did], d):
+                    continue  # outside the pickup radius -> ineligible
+                cand.append((did, d))
+                pickup[(oid, did)] = d
+            # Ascending pickup distance: nearest driver is most preferred.
+            cand.sort(key=lambda t: t[1])
+            pref[oid] = cand
+
+        # --- Deferred acceptance (orders propose) -------------------------
+        # Each order walks down its preference list proposing to drivers. A
+        # driver tentatively holds up to (quota, remaining capacity) proposals,
+        # keeping the highest-priced ones and rejecting the rest; rejected
+        # orders propose to their next-preferred driver. Iterates until every
+        # order is held or has exhausted its list.
+        max_n = self.max_orders_per_driver
+        # next pointer into each order's preference list.
+        next_idx: Dict[int, int] = {oid: 0 for oid in pref}
+        # tentative holds: {driver_id: set of held order ids}.
+        held: Dict[int, set] = {did: set() for did in observations}
+        # remaining free capacity as we tentatively fill each driver.
+        rem_cap: Dict[int, int] = dict(free_cap)
+
+        # Orders that still want to propose (have a next choice, not held).
+        free_orders = [oid for oid in pref if pref[oid]]
+
+        def _driver_can_take(did: int, party: int) -> bool:
+            """Driver has quota slots left AND enough remaining capacity."""
+            return len(held[did]) < max_n and rem_cap[did] >= party
+
+        while free_orders:
+            oid = free_orders.pop()
+            plist = pref[oid]
+            party = party_of[oid]
+            placed = False
+            # Walk down the order's remaining preferences until placed / exhausted.
+            while next_idx[oid] < len(plist):
+                did, _d = plist[next_idx[oid]]
+                next_idx[oid] += 1
+                if _driver_can_take(did, party):
+                    # Free slot: driver tentatively accepts.
+                    held[did].add(oid)
+                    rem_cap[did] -= party
+                    placed = True
+                    break
+                # Driver full: does this order out-rank (higher price, tie ->
+                # closer) its currently-held least-preferred order that this
+                # order could DISPLACE while respecting capacity?
+                # Find the held order the driver likes LEAST.
+                worst = min(
+                    held[did],
+                    key=lambda h: (price_of[h], -pickup.get((h, did), 0.0), -h),
+                )
+                # The proposing order is preferred iff it pays more (tie: closer
+                # pickup, then smaller id). Only displace if freeing the worst
+                # order yields enough capacity for this one.
+                better = (
+                    price_of[oid],
+                    -pickup.get((oid, did), 0.0),
+                    -oid,
+                ) > (
+                    price_of[worst],
+                    -pickup.get((worst, did), 0.0),
+                    -worst,
+                )
+                if better and rem_cap[did] + party_of[worst] >= party:
+                    # Evict the worst held order, admit this one.
+                    held[did].discard(worst)
+                    rem_cap[did] += party_of[worst]
+                    held[did].add(oid)
+                    rem_cap[did] -= party
+                    placed = True
+                    # The evicted order becomes free again to re-propose.
+                    if next_idx[worst] < len(pref[worst]):
+                        free_orders.append(worst)
+                    break
+                # else: driver rejects; try this order's next preference.
+            # If not placed and list exhausted, the order stays pending.
+            del placed  # (documentation-only local)
+
+        # --- Emit the committed stable matching ---------------------------
+        bids: Dict[int, List[int]] = {did: [] for did in observations}
+        for did, oids in held.items():
+            for oid in oids:
+                bids[did].append(oid)
+                self.last_assignment_distances[oid] = pickup[(oid, did)]
 
         return {did: {"orders": oids} for did, oids in bids.items()}

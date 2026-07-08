@@ -1,33 +1,33 @@
 """
-ridepool_sim: A multi-agent ride-pooling & dispatching simulation environment.
+ride_gym: A multi-agent ride-pooling & dispatching simulation environment.
 
 Gym-like (not Gym-dependent) interface for transportation gig-market research.
 Initial focus: ride-pooling and vehicle relocation.
 """
 
-from ridepool_sim.enums import DriverStatus, OrderStatus
-from ridepool_sim.exceptions import (
+from ride_gym.enums import DriverStatus, OrderStatus
+from ride_gym.exceptions import (
     InvalidActionError,
     ConflictError,
     EnvironmentError as RideSimError,
 )
-from ridepool_sim.entities import Order, Driver
-from ridepool_sim.road_network import (
+from ride_gym.entities import Order, Driver
+from ride_gym.road_network import (
     RoadNetwork,
     EuclideanNetwork,
     ManhattanNetwork,
 )
-from ridepool_sim.order_generator import (
+from ride_gym.order_generator import (
     OrderGenerator,
     RandomOrderGenerator,
     DataFrameOrderGenerator,
     NYCOrderGenerator,
     MultiWindowNYCOrderGenerator,
 )
-from ridepool_sim.routing import RoutesPlanner, GreedyInsertionPlanner
-from ridepool_sim.rewards import RewardFunction, DefaultRewardFunction
-from ridepool_sim.env import RidePoolEnv
-from ridepool_sim.wrappers import CentralizedWrapper
+from ride_gym.routing import RoutesPlanner, GreedyInsertionPlanner
+from ride_gym.rewards import RewardFunction, DefaultRewardFunction
+from ride_gym.env import RidePoolEnv
+from ride_gym.wrappers import CentralizedWrapper
 
 __version__ = "0.1.0"
 

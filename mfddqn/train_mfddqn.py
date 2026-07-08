@@ -50,7 +50,7 @@ class MFTrainConfig:
 
     # Optimisation / agent.
     gamma: float = 0.99
-    lr: float = 1e-3
+    lr: float = 5e-4
     batch_size: int = 8
     tau: float = 0.01
     target_sync_every: int = 20
@@ -58,7 +58,13 @@ class MFTrainConfig:
     hidden: tuple = (128, 128)
 
     # Mean-field specifics.
-    neighbours_k: int = 20
+    # How each driver's mean-field neighbourhood is chosen:
+    #   "knn"    -> the ``neighbours_k`` nearest drivers (fixed count).
+    #   "radius" -> every other driver within ``neighbour_radius_km`` km
+    #               (variable count; a true metric radius even on lon/lat).
+    neighbour_mode: str = "knn"
+    neighbours_k: int = 30
+    neighbour_radius_km: float = 1.0
     mf_iters: int = 2
     simplified: bool = True
 
@@ -81,11 +87,11 @@ class MFTrainConfig:
     # Exploration anneal.
     anneal_t0: float = 1.0
     anneal_mode: str = "exponential"
-    anneal_decay: float = 0.9995
+    anneal_decay: float = 0.9998
     anneal_decay_steps: int = 20_000
-    anneal_t_min: float = 0.0
+    anneal_t_min: float = 0.001
     noise_coef: float = 1.0
-    scale_stat: str = "std"
+    scale_stat: str = "std"  # "std" or "mean_abs"
     scale_floor: float = 1e-3
 
     # Candidate pruning (kept for parity; dense by default).
@@ -179,10 +185,15 @@ class MFDDQNTrainer:
         )
         self.encoder = FeatureEncoder(self.fc)
 
-        # Mean-field block width == order feature width.
+                # Mean-field block width == order feature width.
         mean_field_dim = self.fc.order_dim
         self.mf_cfg = MeanFieldConfig(
+            neighbour_mode=cfg.neighbour_mode,
             neighbours_k=cfg.neighbours_k,
+            neighbour_radius_km=cfg.neighbour_radius_km,
+            # Convert coordinate deltas to km for the radius test (identity for
+            # abstract km scenarios; local lon/lat factors for osmnx/nyc).
+            coord_to_km=self._coord_to_km,
             iters=cfg.mf_iters,
             simplified=cfg.simplified,
             # Shared by the actor and the agent's Q-target so idling behaviour

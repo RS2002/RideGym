@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Dict
 
-from ridepool_sim.env import RidePoolEnv
+from ride_gym.env import RidePoolEnv
 
 
 class CentralizedWrapper:

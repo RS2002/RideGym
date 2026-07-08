@@ -106,9 +106,9 @@ class QNoiseExplorer:
         rng:
             Optional numpy Generator for reproducibility.
         """
-        if scale_stat not in ("std", "mean_abs"):
+        if scale_stat not in ("std", "mean_abs", "bsc"):
             raise ValueError(
-                f"scale_stat must be 'std' or 'mean_abs', got {scale_stat!r}"
+                f"scale_stat must be 'std' or 'mean_abs' or 'bsc', got {scale_stat!r}"
             )
         self.schedule = schedule or AnnealSchedule()
         self.noise_coef = float(noise_coef)
@@ -139,10 +139,16 @@ class QNoiseExplorer:
         if pool.size:
             if self.scale_stat == "std":
                 stat = float(pool.std())
-            else:  # "mean_abs"
-                stat = float(abs(pool.mean()))
+            elif self.scale_stat == "mean_abs":
+                # stat = float(abs(pool.mean()))
+                stat = float((pool-pool.min()).mean())  # mean of positive-shifted pool
+            elif self.scale_stat == "bsc":
+                stat = 1.0
+            else:
+                stat = 0.0
+            
         else:
-            stat = 1.0
+            stat = 0.0
         stat = max(stat, self.scale_floor)  # guard against vanishing noise
         scale = self.noise_coef * stat * t
         if scale <= 0.0:
@@ -150,8 +156,20 @@ class QNoiseExplorer:
 
         q_real_out = q_real.copy()
         if legal_mask.any():
-            noise_real = self.rng.standard_normal(size=legal_mask.sum()) * scale
-            q_real_out[legal_mask] = q_real[legal_mask] + noise_real
-        noise_dummy = self.rng.standard_normal(size=q_dummy.shape) * scale
-        q_dummy_out = q_dummy + noise_dummy
+            if self.scale_stat == "bsc":
+                noise_real = np.random.random(size=legal_mask.sum()) < scale
+                noise_real = noise_real.astype(float) * 1e8
+                # q_real_out[legal_mask] = noise_real
+                q_real_out[legal_mask] = q_real[legal_mask] + noise_real
+            else:
+                noise_real = self.rng.standard_normal(size=legal_mask.sum()) * scale
+                q_real_out[legal_mask] = q_real[legal_mask] + noise_real
+        if self.scale_stat == "bsc":
+            noise_dummy = np.random.random(size=q_dummy.shape) < scale
+            noise_dummy = noise_dummy.astype(float) * 1e8
+            # q_dummy_out = noise_dummy
+            q_dummy_out = q_dummy + noise_dummy
+        else:
+            noise_dummy = self.rng.standard_normal(size=q_dummy.shape) * scale
+            q_dummy_out = q_dummy + noise_dummy
         return q_real_out, q_dummy_out

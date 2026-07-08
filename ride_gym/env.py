@@ -34,13 +34,13 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 
-from ridepool_sim.entities import Driver, Order, TaskPoint
-from ridepool_sim.enums import DriverStatus, OrderStatus
-from ridepool_sim.exceptions import ConflictError, InvalidActionError
-from ridepool_sim.order_generator import OrderGenerator, RandomOrderGenerator
-from ridepool_sim.rewards import DefaultRewardFunction, RewardFunction
-from ridepool_sim.road_network import EuclideanNetwork, RoadNetwork
-from ridepool_sim.routing import GreedyInsertionPlanner, RoutesPlanner
+from ride_gym.entities import Driver, Order, TaskPoint
+from ride_gym.enums import DriverStatus, OrderStatus
+from ride_gym.exceptions import ConflictError, InvalidActionError
+from ride_gym.order_generator import OrderGenerator, RandomOrderGenerator
+from ride_gym.rewards import DefaultRewardFunction, RewardFunction
+from ride_gym.road_network import EuclideanNetwork, RoadNetwork
+from ride_gym.routing import GreedyInsertionPlanner, RoutesPlanner
 
 Coord = Tuple[float, float]
 Area = Tuple[float, float, float, float]
@@ -1050,16 +1050,15 @@ class RidePoolEnv:
         return observations, rewards, dones, info
 
     # -------------------------------------------------------------- utilities
-    def render(self) -> None:
-        """Placeholder for trajectory / heat-map visualisation (future work)."""
-        served = sum(
-            1 for o in self.orders.values() if o.status == OrderStatus.COMPLETED
-        )
-        cancelled = sum(
-            1 for o in self.orders.values() if o.status == OrderStatus.CANCELLED
-        )
-        pending = len(self._pending_ids)
-        print(
-            f"[t={self.time:6.1f}] drivers={self.num_drivers} "
-            f"served={served} cancelled={cancelled} pending={pending}"
-        )
+    def render(self, mode: str = "human", **kwargs):
+        """Render the current simulation state.
+
+        Delegates to :func:`ride_gym.visualize.render_frame`. ``mode="human"``
+        returns a matplotlib Figure (and saves it when ``save_path=`` is given);
+        ``mode="rgb_array"`` returns an ``(H, W, 3)`` uint8 frame for animation.
+        The import is local so matplotlib stays an optional dependency: headless
+        training never imports it.
+        """
+        from ride_gym.visualize import render_frame
+
+        return render_frame(self, mode=mode, **kwargs)

@@ -16,7 +16,7 @@ applying, in order:
    ``sample_rate`` (default 1.0 = keep all) with a fixed seed for reproducibility.
 
 Each surviving trip becomes one order row with the columns expected by
-:class:`~ridepool_sim.order_generator.DataFrameOrderGenerator`:
+:class:`~ride_gym.order_generator.DataFrameOrderGenerator`:
 
     origin_x, origin_y   -- pickup zone centroid (lon, lat)
     dest_x,   dest_y     -- drop-off zone centroid (lon, lat)
@@ -28,10 +28,17 @@ shared-ride request flag. We set ``num_passengers = 1`` for every order (each
 request is one party); pooling still happens via the planner when several
 single-passenger orders are matched to the same driver.
 
+Input: the raw FHVHV parquet, expected at
+``./dataset/fhvhv_tripdata_2026-04.parquet`` (relative to the cwd); download it
+separately (NYC TLC). Output defaults to ``./data/nyc/orders.parquet``.
+
 Run::
 
-    python -m data.nyc.preprocess_orders
-    python -m data.nyc.preprocess_orders --start "2026-04-01 18:00" --end "2026-04-01 19:00" --sample-rate 0.1
+    python -m ride_gym.data_tools.nyc.preprocess_orders
+    python -m ride_gym.data_tools.nyc.preprocess_orders \\
+        --start "2026-04-01 18:00" --end "2026-04-01 19:00" --sample-rate 0.1
+
+Requires the ``pandas`` / ``pyarrow`` extras (``pip install ride_gym[data]``).
 """
 
 from __future__ import annotations
@@ -40,22 +47,23 @@ import argparse
 import os
 from typing import Set
 
-import numpy as np
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-from data.nyc.zone_centroids import load_zone_centroids
-from data.nyc.build_nyc_network import REGION_A_BBOX
-
-_HERE = os.path.dirname(__file__)
-DEFAULT_PARQUET = os.path.join(
-    _HERE, "..", "..", "dataset", "fhvhv_tripdata_2026-04.parquet"
-)
-DEFAULT_OUT = os.path.join(_HERE, "orders.parquet")
+from ride_gym.data_tools.nyc.zone_centroids import load_zone_centroids
+from ride_gym.data_tools.nyc.build_nyc_network import REGION_A_BBOX
 
 # Only the columns we actually need (fewer columns = faster, lighter batches).
 _READ_COLS = ["request_datetime", "PULocationID", "DOLocationID"]
+
+
+def default_parquet_path() -> str:
+    """Default raw input: ``./dataset/fhvhv_tripdata_2026-04.parquet``."""
+    return os.path.join(
+        os.getcwd(), "dataset", "fhvhv_tripdata_2026-04.parquet"
+    )
+
+
+def default_out_path() -> str:
+    """Default output: ``./data/nyc/orders.parquet`` under the cwd."""
+    return os.path.join(os.getcwd(), "data", "nyc", "orders.parquet")
 
 
 def _zones_in_bbox(centroids: dict, bbox: tuple) -> Set[int]:
@@ -69,8 +77,8 @@ def _zones_in_bbox(centroids: dict, bbox: tuple) -> Set[int]:
 
 
 def preprocess_orders(
-    parquet_path: str = DEFAULT_PARQUET,
-    out_path: str = DEFAULT_OUT,
+    parquet_path: str | None = None,
+    out_path: str | None = None,
     start: str = "2026-04-01 08:00",
     end: str = "2026-04-01 09:00",
     bbox: tuple = REGION_A_BBOX,
@@ -79,8 +87,18 @@ def preprocess_orders(
     batch_size: int = 300_000,
 ) -> str:
     """Stream-filter the raw parquet into a small order file. Returns out_path."""
+    # Lazy imports: pandas / pyarrow are optional (data extra) and heavy.
+    import numpy as np
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     if not (0.0 < sample_rate <= 1.0):
         raise ValueError(f"sample_rate must be in (0, 1], got {sample_rate}")
+
+    parquet_path = parquet_path or default_parquet_path()
+    out_path = out_path or default_out_path()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     centroids = load_zone_centroids()
     zone_set = _zones_in_bbox(centroids, bbox)
@@ -162,8 +180,10 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description="Filter the FHVHV parquet into a small order file."
     )
-    p.add_argument("--parquet", default=DEFAULT_PARQUET)
-    p.add_argument("--out", default=DEFAULT_OUT)
+    p.add_argument("--parquet", default=None,
+                   help="raw FHVHV parquet (default: ./dataset/fhvhv_tripdata_2026-04.parquet).")
+    p.add_argument("--out", default=None,
+                   help="output order file (default: ./data/nyc/orders.parquet).")
     p.add_argument("--start", default="2026-04-01 08:00")
     p.add_argument("--end", default="2026-04-01 09:00")
     p.add_argument(

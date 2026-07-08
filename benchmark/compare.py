@@ -12,11 +12,18 @@ prints a side-by-side summary table of key KPIs.
 from __future__ import annotations
 
 from benchmark.config import BenchmarkConfig
-from benchmark.baselines import NearestDistanceDispatch, HungarianDispatch
+from benchmark.baselines import (
+    NearestDistanceDispatch,
+    HungarianDispatch,
+    RandomRadiusDispatch,
+    GaleShapleyDispatch,
+)
 from benchmark.runner import run_episode
 
 # Registry of (display name, factory taking a BenchmarkConfig) baselines.
 BASELINES = {
+    "random_radius": lambda cfg: RandomRadiusDispatch.from_config(cfg, k_nearest=20),
+    "gale_shapley": lambda cfg: GaleShapleyDispatch.from_config(cfg, k_nearest=20),
     "nearest_distance": lambda cfg: NearestDistanceDispatch.from_config(cfg, k_nearest=20),
     "hungarian": lambda cfg: HungarianDispatch.from_config(cfg, k_nearest=20),
 }

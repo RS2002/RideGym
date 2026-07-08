@@ -1,411 +1,289 @@
-# ridepool-sim
+# RideGym
 
-A multi-agent **ride-pooling & dispatching** simulation environment for
-transportation gig-market research. It provides a Gym-like (but **not**
-Gym-dependent) interface, a strict and reproducible event loop, pluggable road
-networks / order sources / reward functions, a set of dispatch baselines
-(nearest-distance, Hungarian) and an Independent Double-DQN (IDDQN) learned
-dispatcher. The design targets low-cost extension to food delivery, dynamic
-pricing, multimodal transport, EV charging, multi-platform competition, and
-mixed passenger/freight.
+**Article:** Zijian Zhao, Yulong Hu, Sen Li*, "RideGym: A Standardized Interface for Real-World Large-Scale Ride-Sharing System" (in preperation)
 
-The environment runs in two coordinate regimes:
+[ride-gym · PyPI](https://pypi.org/project/ride-gym/) is a Gym-like (but not Gym-dependent) simulation environment for large-scale ride-pooling and order dispatching.
 
-* **Abstract coordinates** (kilometres) on a Euclidean / Manhattan metric, for
-  fast synthetic experiments.
-* **Real road networks** (geographic `(lon, lat)`) backed by an OpenStreetMap
-  graph, with O(1) shortest-path distances from precomputed all-pairs matrices.
-  This regime can be driven by either synthetic demand or **real historical
-  trip data** (e.g. the NYC FHVHV ride-hailing dataset).
+<img src="./img/workflow.png" style="zoom:22%;" />
+
+A fleet of vehicles serves a stream of ride requests that arrive over time, with realistic pooling, capacity limits, road-network routing, and impatient passengers. Each vehicle is an agent under a fully-centralized multi-agent setting: at every decision step you assign pending orders to vehicles, and the simulator handles conflict resolution, route re-planning, movement, and reward computation. The env is built from swappable components (order source, road network, route planner, reward), so you can plug in your own without touching the core loop.
 
 ---
 
-## Table of contents
+## Contents
 
-1. [Installation](#installation)
-2. [Quick start](#quick-start)
-3. [Repository layout](#repository-layout)
-4. [Environment interface](#environment-interface)
-5. [Core mechanics](#core-mechanics)
-6. [The benchmark scenario](#the-benchmark-scenario)
-7. [Running baselines](#running-baselines)
-8. [Training the IDDQN dispatcher](#training-the-iddqn-dispatcher)
-9. [Using your own data and run region](#using-your-own-data-and-run-region)
-10. [Tests](#tests)
+- [Part 1 — The `ride_gym` environment](#part-1--the-ride_gym-environment) &nbsp;(install & use the simulator)
+- [Part 2 — The research benchmark](#part-2--the-research-benchmark) &nbsp;(reproduce our train / test results)
+  - [Repository layout](#repository-layout)
+  - [Setup](#benchmark-setup)
+  - [Step A — Prepare the NYC data](#step-a--prepare-the-nyc-data)
+  - [Step B — Train the RL dispatch agents](#step-b--train-the-rl-dispatch-agents)
+  - [Step C — Test & compare on held-out windows](#step-c--test--compare-on-held-out-windows)
 
 ---
+
+# Part 1 — The `ride_gym` environment
+
+The simulator is published on PyPI and can be used entirely on its own (no benchmark code required).
 
 ## Installation
 
 ```bash
-pip install -e .            # core (numpy only)
-pip install -e .[data]      # + pandas (DataFrame / file order sources)
-pip install -e .[osmnx]     # + osmnx (real road networks)
-pip install -e .[dev]       # + pytest
+pip install ride-gym
 ```
 
-Real-network and learned-dispatch features additionally need `networkx`,
-`scipy`, `pyarrow`, `geopandas`, `matplotlib` and `torch`. Install the ones you
-need for the workflow you intend to run (see below).
-
----
-
-## Quick start
-
-A minimal abstract-coordinate episode with a conflict-free random policy:
-
-```python
-from ridepool_sim import RidePoolEnv, RandomOrderGenerator, ManhattanNetwork
-from ridepool_sim.policies import RandomConflictFreePolicy
-
-env = RidePoolEnv(
-    area=(0, 0, 50, 50),
-    num_drivers=8,
-    driver_capacity=4,
-    dt=1.0,
-    horizon=120.0,
-    order_timeout=12.0,
-    road_network=ManhattanNetwork(speed=2.0),
-    order_generator=RandomOrderGenerator((0, 0, 50, 50), 120.0, 120, arrival="poisson"),
-    seed=0,
-)
-
-policy = RandomConflictFreePolicy(seed=0)
-obs, info = env.reset(seed=0)
-while True:
-    obs, rewards, dones, info = env.step(policy.act(obs))
-    if dones["__all__"]:
-        break
-```
-
-Run the bundled demo (decentralised + centralised):
+The core only needs `numpy`. Install extras as needed:
 
 ```bash
-python -m examples.demo_random
+pip install ride-gym[data]     # pandas/pyarrow/geopandas/osmnx: build & preprocess real demand
+pip install ride-gym[osmnx]    # real OpenStreetMap road networks
+pip install ride-gym[viz]      # matplotlib: rendering & animation
+pip install ride-gym[all]      # everything
 ```
 
+Requires Python >= 3.9.
+
+## Quickstart
+
+```python
+from ride_gym import RidePoolEnv
+from ride_gym.order_generator import RandomOrderGenerator
+from ride_gym.road_network import ManhattanNetwork
+
+# 1. Demand: your own trips, or a procedural generator.
+order_gen = RandomOrderGenerator(
+    area=(0.0, 0.0, 10.0, 10.0), horizon=60.0, num_orders=10000,
+    arrival="poisson", max_party_size=3,
+)
+
+# 2. Road network: abstract backend, or a real OSM graph (see below).
+network = ManhattanNetwork(speed=1.0)   # coordinate units per minute
+
+# 3. Environment.
+env = RidePoolEnv(
+    num_drivers=1000,
+    driver_capacity=4,
+    dt=1.0, horizon=60.0,
+    order_timeout=3.0,          # orders waiting longer than this are withdrawn
+    order_generator=order_gen,
+    road_network=network,
+)
+
+# 4. Roll out. obs / rewards are dicts keyed by vehicle id.
+obs, info = env.reset(seed=0)
+done = False
+while not done:
+    actions = {}
+    for i, s_v in obs.items():
+        pool = s_v["pending_orders"]        # orders waiting to be assigned
+        order_ids = my_policy(s_v, pool)    # -> list of order ids to bid on
+        actions[i] = {"orders": order_ids}  # empty list = take no order
+    obs, rewards, dones, info = env.step(actions)
+    done = dones["__all__"]
+```
+
+Drop your training code straight into the loop between `step` calls.
+
+## Actions
+
+Each vehicle's action is a small dict (the two keys are mutually exclusive):
+
+```python
+{"orders": [order_id, ...]}    # bid on pending orders (empty = take no order)
+{"relocate": index_or_coord}   # idle vehicles only: reposition to a point
+```
+
+The simulator automatically enforces feasibility every step: an order goes to at most one vehicle, and a vehicle never exceeds its remaining capacity. If two vehicles bid on the same order the env raises a `ConflictError` — the upstream (central) policy must coordinate to avoid conflicts.
+
+## Order sources
+
+Bring your own historical trips as a table (one row per order):
+
+```python
+from ride_gym.order_generator import DataFrameOrderGenerator
+
+# Columns: origin_x, origin_y, dest_x, dest_y, request_time, num_passengers
+order_gen = DataFrameOrderGenerator(dataframe=my_orders_df)
+```
+
+or use `RandomOrderGenerator` for synthetic demand with `uniform` / `poisson` / `peak` arrivals. For the real NYC scenario ([TLC Trip Record Data - TLC](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page)) there are also `NYCOrderGenerator` (single window) and `MultiWindowNYCOrderGenerator` (train/val/test window pools).
+
+## Road networks
+
+For abstract experiments, use the fast closed-form `EuclideanNetwork` or `ManhattanNetwork`. For real maps, `OSMnxNetwork` loads an OpenStreetMap graph whose all-pairs shortest paths are precomputed and cached to disk, so every distance query is an `O(1)` lookup:
+
+```python
+from ride_gym.osmnx_network import OSMnxNetwork
+network = OSMnxNetwork(graph_path="data/manhattan.gpickle")
+```
+
+## Custom rewards
+
+A `DefaultRewardFunction` modelling platform revenue and passenger satisfaction is provided. To optimize for your own criteria (waiting time, service rate, detour, ...), subclass `RewardFunction` and pass it to the env:
+
+```python
+from ride_gym import RidePoolEnv, DefaultRewardFunction
+env = RidePoolEnv(..., reward_function=DefaultRewardFunction(assignment_bonus=1.0))
+```
+
+## Centralized view
+
+For single-agent / global-optimization research, wrap the env so one policy emits all actions and gets an aggregated reward (the per-vehicle rewards are kept in `info`):
+
+```python
+from ride_gym import CentralizedWrapper
+env = CentralizedWrapper(RidePoolEnv(...), aggregate="sum")
+obs, reward, done, info = env.step(joint_action)
+```
+
+## Visualization
+
+With the `[viz]` extra you can render a single frame or animate a whole episode:
+
+```python
+from ride_gym.visualize import TrajectoryRecorder, render_animation
+
+env.render(mode="human", save_path="frame.png")   # one static frame
+
+rec = TrajectoryRecorder()
+obs, _ = env.reset(seed=0)
+done = False
+while not done:
+    obs, rewards, dones, info = env.step(my_policy(obs))
+    rec.snapshot(env)
+    done = dones["__all__"]
+render_animation(rec, out_path="episode.gif")     # or .mp4
+```
+
+Each vehicle is drawn in its own color, with its current location, planned route along the road network, and the origins/destinations of the orders it is serving. Aggregate plots (demand & service heatmaps, supply-demand gaps, load time series, waiting-time distributions) are also available via `ride_gym.analysis`.
+
 ---
+
+# Part 2 — The research benchmark
+
+This repository also contains the full **benchmark** we use to study learning-based order dispatching on a real New York City ride-pooling scenario. It provides:
+
+- **Three RL dispatch agents** — `iddqn` (Independent Double DQN with bipartite matching, supporting the MLP/Assignment-Net/CV-Net), `mfddqn` (Mean-Field DDQN), and `bmgq` (BMG-Q, a graph-attention mean-field variant).
+- **Model-based baselines** — `random_radius`, `gale_shapley`, `nearest_distance`, `hungarian`.
+- **A fair evaluation harness** — every method runs through the same seeded episodes on the same held-out NYC test windows, so KPI differences reflect only the dispatch policy.
+
+> This repository bundles the `ride_gym/` environment source together with the benchmark code (`benchmark/`, `iddqn/`, `mfddqn/`, `bmgq/`), so the benchmark runs entirely from a clone with no separate install of the environment required. (The standalone `ride_gym` package is also published on PyPI for use outside this benchmark.)
 
 ## Repository layout
 
-| Path | Responsibility |
-|------|----------------|
-| `ridepool_sim/` | Core simulation package (see [modules](#modules)). |
-| `benchmark/` | Standard benchmark config, env factory, baselines, episode runner, recorder, comparison driver. |
-| `iddqn/` | Independent Double-DQN learned dispatcher: features, Q-net, replay, exploration, bipartite matching, trainer, log plotting. |
-| `data/` | Road-network builders + cached graphs. `data/build_network.py` builds an arbitrary region; `data/nyc/` builds the NYC scenario assets. |
-| `dataset/` | Raw external inputs (NYC FHVHV parquet + taxi-zone shapefile). Download separately. |
-| `examples/` | Runnable demos. |
-| `tests/` | Unit tests. |
+```
+ride_gym/            # the simulation environment (the pip package)
+  data_tools/        #   NYC data-preparation CODE (no bundled data)
+benchmark/           # evaluation harness: config, runner, baselines, run_test
+iddqn/               # IDDQN agent + trainer
+mfddqn/              # Mean-Field DDQN agent + trainer
+bmgq/                # BMG-Q agent + trainer
+data/                # generated data lands here (git-ignored, not shipped)
+dataset/             # raw inputs you download (FHVHV parquet, taxi zones)
+```
 
-### Modules
+## Step A — Prepare the NYC data
 
-| Module | Responsibility |
-|--------|----------------|
-| `enums.py` | Driver / order lifecycle states |
-| `exceptions.py` | `InvalidActionError`, `ConflictError` |
-| `entities.py` | `Order`, `Driver`, `TaskPoint` |
-| `road_network.py` | `RoadNetwork` interface + Euclidean / Manhattan defaults |
-| `osmnx_network.py` | Real OSM road network with O(1) distances and disk-cached all-pairs matrices |
-| `routing.py` | `RoutesPlanner` + greedy precedence-aware sequencer |
-| `order_generator.py` | Random / OSM-random / DataFrame / NYC-file order sources |
-| `rewards.py` | `RewardFunction` + default multi-component reward |
-| `env.py` | `RidePoolEnv` (decentralised core) |
-| `wrappers.py` | `CentralizedWrapper` (single-agent view) |
-| `policies.py` | Conflict-free baseline policy |
+The scenario is built from public NYC TLC data. Download two raw inputs into `./dataset/`:
 
----
+1. **High-Volume FHV trip records** (one month, parquet) from the
+   [NYC TLC Trip Record Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) page, saved as
+   `./dataset/fhvhv_tripdata_2026-04.parquet` (any month works — adjust the dates in `build_splits.py`).
+2. **Taxi Zone shapefile** from the same page, extracted to
+   `./dataset/taxi_zones/taxi_zones.shp`.
 
-## Environment interface
+Then build the derived assets with the `ride_gym.data_tools` command-line tools (they all write under `./data/`):
 
-### Decentralised multi-agent (base env)
+```bash
+# 1. Reduce taxi-zone polygons to (lon, lat) centroids  ->  data/nyc/zone_centroids.csv
+python -m ride_gym.data_tools.nyc.zone_centroids
 
-* `reset(seed=None) -> (observations, info)`
-* `step(actions) -> (observations, rewards, dones, info)`
+# 2. Download & cache the Manhattan region-A road network  ->  data/nyc/manhattan.gpickle
+python -m ride_gym.data_tools.nyc.build_nyc_network
 
-Keyed by `driver_id`. `dones` includes an `"__all__"` flag.
+# 3. (optional) Preprocess ONE order window  ->  data/nyc/orders.parquet
+python -m ride_gym.data_tools.nyc.preprocess_orders
 
-**Action schema** (plain dict per driver; the two keys are mutually exclusive):
+# 4. Slice raw trips into train/val/test window files + manifest  ->  data/nyc/splits/
+python -m ride_gym.data_tools.nyc.build_splits            # 60-min windows (default)
+```
 
-| Key | Meaning |
-|-----|---------|
-| `{"orders": [id, ...]}` | Bid on a set of pending order ids (may be empty = hold). |
-| `{"relocate": idx \| (x, y)}` | Relocate to a preset point index or a coordinate. |
+After step 4 you should have:
 
-**Observation** per driver (a plain dict):
+```
+data/nyc/manhattan.gpickle
+data/nyc/zone_centroids.csv
+data/nyc/splits/manifest.json
+data/nyc/splits/train/window_XXXX.parquet
+data/nyc/splits/val/window_XXXX.parquet
+data/nyc/splits/test/window_XXXX.parquet
+```
 
-| Key | Contents |
-|-----|----------|
-| `self` | This driver's full private state (id, location, status, capacity, onboard, assigned orders). |
-| `all_drivers` | Public state `{driver_id: {location, status, onboard_passengers}}` of **every** driver, *including this one*. |
-| `pending_orders` | Shared snapshot of pending orders (id, origin, destination, party size, waiting time). |
-| `time` | Current simulation time (minutes). |
-| `relocation_points` | The relocation grid (an immutable tuple). |
+The train / val / test windows come from **disjoint day ranges**, so there is no temporal leakage. Edit `TRAIN_DAYS` / `VAL_DAYS` / `TEST_DAYS` and `DAILY_WINDOW_STARTS` at the top of `ride_gym/data_tools/nyc/build_splits.py` to match your data month and desired coverage.
 
-> **Performance / safety note:** the `all_drivers`, `pending_orders` and
-> `relocation_points` structures are **shared by reference** across all drivers'
-> observations (built once per step, not per driver) to avoid an
-> O(num_drivers²) cost. They must be treated as **read-only**.
+## Step B — Train the RL dispatch agents
 
-### Centralised single-agent (wrapper)
+Each agent has its own trainer. Hyper-parameters and the scenario (drivers, horizon, splits, ...) live in that trainer's `TrainConfig`; run it as a module to train with the defaults:
+
+```bash
+python -m iddqn.train_iddqn      # IDDQN
+python -m mfddqn.train_mfddqn    # Mean-Field DDQN
+python -m bmgq.train_bmgq        # BMG-Q
+```
+
+Each run creates a timestamped directory `<algo>/runs/<algo>_YYYYmmdd_HHMMSS/` containing:
+
+- `config.json` — the exact config used;
+- `checkpoints/<algo>_ep<N>.pt` — periodic model checkpoints;
+- `train_log.csv` / `eval_log.csv` — training and validation curves;
+- `eval_details/` — per-episode KPI dumps.
+
+Training periodically evaluates on the **val** split and, at the end, on the held-out **test** split, printing a KPI table against the `nearest` / `hungarian` baselines.
+
+**Customizing a run.** The trainers are driven by a Python config, not CLI flags. Either edit the defaults in e.g. `iddqn/train_iddqn.py::TrainConfig`, or drive it programmatically:
 
 ```python
-from ridepool_sim import CentralizedWrapper
-env = CentralizedWrapper(RidePoolEnv(...), aggregate="sum")
-obs, reward, done, info = env.step(joint_action)
-# info["individual_rewards"] -> per-driver reward dict
-```
-
----
-
-## Core mechanics
-
-Per-step event flow (order is intentional and enforced):
-
-1. **Cancel timed-out** pending orders **before any action handling**.
-2. Drivers act on the observation from the previous step.
-3. **Validate** actions, run **conflict detection**, then assign / relocate.
-4. **Physical movement** one time step along each driver's planned route.
-5. **Order state updates** on pickup / drop-off arrival.
-6. **Advance clock**, inject newly-arrived orders.
-7. **Rewards** from the per-step event log.
-8. **Termination** at the horizon.
-
-Key guarantees:
-
-* **Mutual-exclusion** of bid vs relocate is strictly enforced (`InvalidActionError`).
-* **Conflict = exception**: if two drivers bid the same order, `ConflictError`
-  is raised. The env **never auto-arbitrates**; upstream policies must coordinate.
-* **Pickup-before-dropoff** precedence is enforced by the routing planner.
-* **Capacity accounting** includes onboard + assigned-but-not-picked-up.
-* **Greedy capacity drop**: if a bid set exceeds capacity, the env drops the
-  largest-party orders until it fits (it does not raise); dropped orders stay
-  pending.
-* **Race tolerance**: bidding an order that was auto-cancelled between
-  observation and step is silently ignored; bidding an *unknown* id is a hard
-  error.
-
----
-
-## The benchmark scenario
-
-`benchmark/config.py` centralises a single, reproducible benchmark scenario in
-the `BenchmarkConfig` dataclass. The defaults model a one-hour urban window:
-
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `network_kind` | `"nyc"` | `"euclidean"` / `"manhattan"` (abstract) or `"osmnx"` / `"nyc"` (real road network). |
-| `num_drivers` | `1000` | Number of driver agents. |
-| `num_orders` | `15000` | Total synthetic orders (ignored in `"nyc"` mode, where demand is read from the data file). |
-| `horizon` | `60.0` | Episode length in minutes. |
-| `dt` | `1.0` | Decision interval in minutes (60 steps). |
-| `speed_kmh` | `60.0` | Constant driver speed. |
-| `driver_capacity` | `3` | Per-driver passenger capacity. |
-| `order_timeout` | `5.0` | Minutes a pending order may wait before auto-cancellation. |
-| `arrival` | `"uniform"` | Synthetic temporal demand (`uniform` / `poisson` / `peak`). |
-| `osmnx_graph_path` | `data/guomao.gpickle` | Cached graph for `"osmnx"` mode. |
-| `nyc_graph_path` | `data/nyc/manhattan.gpickle` | Cached graph for `"nyc"` mode. |
-| `nyc_order_path` | `data/nyc/orders.parquet` | Preprocessed real demand file for `"nyc"` mode. |
-| `nyc_order_limit` | `None` | Optional cap on loaded NYC orders. |
-
-Build an env from a config with `make_benchmark_env(cfg)`. For real-network
-modes the service area is taken from the **graph's geographic bounds**, not the
-abstract `area` rectangle. This is handled automatically by `resolved_area()`
-and the env factory, and it is critical for correct spatial indexing and feature
-normalisation.
-
----
-
-## Running baselines
-
-Compare the bundled dispatch baselines on the *same* scenario (same seed, same
-drivers / orders) and print a side-by-side KPI table:
-
-```bash
-python -m benchmark.compare
-```
-
-This runs `NearestDistanceDispatch` and `HungarianDispatch`, writes detailed
-per-step / per-order / per-driver records under `results/<name>/`, and prints
-key metrics (service rate, complete rate, wait / ride / detour times, empty
-distance ratio, driver utilisation, wall time). To change the scenario, edit the
-`BenchmarkConfig` defaults or pass your own config into `main(cfg=...)`.
-
----
-
-## Training the IDDQN dispatcher
-
-```bash
-python -m iddqn.train_iddqn
-```
-
-The trainer (`iddqn/train_iddqn.py`) builds the benchmark env, collects episodes
-with Q-magnitude-scaled annealed exploration, trains a shared pairwise Q-network
-via a Double-DQN bipartite-matching target, periodically runs a greedy
-evaluation episode, and compares it against the nearest-distance and Hungarian
-baselines on identical scenarios. All hyper-parameters live in `TrainConfig`
-(including a nested `BenchmarkConfig`); logs and checkpoints are written under
-`iddqn/runs/<timestamp>/`.
-
-Plot the resulting curves:
-
-```bash
-python -m iddqn.plot_logs iddqn/runs/<run_name>
-python -m iddqn.plot_logs iddqn/runs/<run_name> --no-show   # headless
-```
-
----
-
-## Using your own data and run region
-
-This is the most important workflow for applying the simulator to a new city or
-a real demand dataset. There are **two independent choices**:
-
-1. **The road network (the run region)** -- which streets the drivers move on,
-   e.g. Manhattan, Beijing Guomao, or Beijing Daxing.
-2. **The demand (the orders)** -- either synthetic demand sampled on the
-   network, or **real historical trips** loaded from a file.
-
-### A. Defining a custom run region
-
-A run region is just a cached OpenStreetMap drive network (a pickled
-`networkx.MultiDiGraph`). `OSMnxNetwork` consumes it and precomputes O(1)
-all-pairs distances (cached to disk as `<graph>.matrices.npz`).
-
-**Option 1 -- centre + radius (any city/district).** Use the general builder.
-For example, **Beijing Daxing**:
-
-```bash
-python -m data.build_network --lat 39.7267 --lon 116.3389 --radius 3000 \
-    --out data/daxing.gpickle
-```
-
-Then point the config at it:
-
-```python
+import dataclasses
+from iddqn.train_iddqn import train, TrainConfig
 from benchmark.config import BenchmarkConfig
-cfg = BenchmarkConfig(network_kind="osmnx", osmnx_graph_path="data/daxing.gpickle")
-```
 
-**Option 2 -- bounding box (used by the NYC scenario).** Use the bbox builder.
-The defaults fetch midtown/lower **Manhattan**:
-
-```bash
-python -m data.nyc.build_nyc_network
-# or a custom box (lon_min lat_min lon_max lat_max):
-python -m data.nyc.build_nyc_network \
-    --lon-min -74.02 --lat-min 40.70 --lon-max -73.93 --lat-max 40.80 \
-    --out data/nyc/manhattan.gpickle
-```
-
-Both builders fetch the drivable network from OpenStreetMap (one-off, online),
-annotate edge speeds/times, prune to the largest strongly-connected component
-(so the all-pairs distance matrix is finite), and pickle the result.
-
-> **Sizing note.** The all-pairs distance + predecessor matrices scale as `N^2`
-> in the node count `N`. A few-thousand-node region is hundreds of MB and a
-> one-off build of tens of seconds (then reloaded sub-second from the cache).
-> Keep the region from growing without re-checking memory.
-
-With a graph in hand you can drive it with **synthetic demand** immediately
-(`network_kind="osmnx"`): orders are sampled on real nodes, guaranteeing every
-endpoint is on the network and reachable. No external dataset is required for
-this path.
-
-### B. Using real external demand (the NYC FHVHV example)
-
-The NYC pipeline turns the raw FHVHV ride-hailing dataset (trips located by
-*taxi zone* id) into a small, simulation-ready order file located by
-`(lon, lat)`, snapped onto the Manhattan network. It is a three-step,
-run-once-per-scenario pipeline.
-
-**Step 0 -- obtain the raw inputs** (downloaded separately):
-
-* `dataset/fhvhv_tripdata_2026-04.parquet` -- the raw FHVHV trip records.
-* `dataset/taxi_zones/taxi_zones.shp` (+ sidecar files) -- the taxi-zone shapefile.
-
-**Step 1 -- zone centroids.** Reduce each taxi-zone polygon to a representative
-`(lon, lat)` point (computed in the projected CRS, then reprojected to WGS84):
-
-```bash
-python -m data.nyc.zone_centroids
-# -> data/nyc/zone_centroids.csv
-```
-
-**Step 2 -- the run region** (already covered in part A):
-
-```bash
-python -m data.nyc.build_nyc_network
-# -> data/nyc/manhattan.gpickle (+ .matrices.npz on first use)
-```
-
-**Step 3 -- preprocess the orders** (this is where you choose the time window,
-region box and sampling rate). The script streams the ~21M-row parquet in
-batches (it never loads it all at once), filtering by time window + region +
-sample rate, and converts zone ids to centroid coordinates and request times to
-minutes-from-start:
-
-```bash
-# default: 2026-04-01 morning peak (08:00-09:00), keep 100% of in-window trips
-python -m data.nyc.preprocess_orders
-
-# a different window and a 10% sample for a quicker run
-python -m data.nyc.preprocess_orders \
-    --start "2026-04-01 18:00" --end "2026-04-01 19:00" \
-    --sample-rate 0.1 --out data/nyc/orders_evening.parquet
-```
-
-`--start` / `--end` set the episode window (the horizon is their difference in
-minutes), `--sample-rate` thins the surviving trips reproducibly, and `--seed`
-fixes that sampling. The output columns are
-`origin_x, origin_y, dest_x, dest_y, request_time, num_passengers`.
-
-**Step 4 -- run it.** Point the benchmark at the assets and run any baseline or
-the trainer. `network_kind="nyc"` is already the default:
-
-```python
-from benchmark.config import BenchmarkConfig
-cfg = BenchmarkConfig(
-    network_kind="nyc",
-    nyc_graph_path="data/nyc/manhattan.gpickle",
-    nyc_order_path="data/nyc/orders.parquet",
-    horizon=60.0,            # match your --start/--end window length
+cfg = TrainConfig(
+    num_episodes=500,
+    benchmark=dataclasses.replace(BenchmarkConfig(), num_drivers=1000, horizon=60.0),
 )
+train(cfg)                    # runs the full training loop
 ```
+
+## Step C — Test & compare on held-out windows
+
+Use `benchmark.run_test` to evaluate any mix of model-based baselines and trained RL checkpoints on **specific** held-out NYC test windows. Every method runs through the same seeded episode on each window, so the comparison is apples-to-apples.
+
+**Model-based baselines only:**
 
 ```bash
-python -m benchmark.compare        # baselines on the NYC scenario
-python -m iddqn.train_iddqn        # train IDDQN on the NYC scenario
+python -m benchmark.run_test \
+    --seed 42 \
+    --baselines nearest_distance hungarian gale_shapley random_radius \
+    --windows 2 10 \
+    --splits-dir data/nyc/splits/test
 ```
 
-In `"nyc"` mode demand is **deterministic** -- the trips, their times and party
-sizes all come from the file, so every episode replays the same real demand
-(`num_orders` and `arrival` are ignored). Each endpoint is snapped to its
-nearest network node, so the chosen run region (Step 2) and the order region
-(`preprocess_orders` bbox) must overlap.
-
-### C. Bringing your own arbitrary dataset
-
-If your data is not NYC-shaped, you have two clean extension points:
-
-* **`DataFrameOrderGenerator`** (`ridepool_sim/order_generator.py`) consumes any
-  pandas DataFrame with columns `origin_x, origin_y, dest_x, dest_y,
-  request_time` (and optional `num_passengers`). Map your columns via its
-  `columns` argument. Use this for abstract-coordinate demand.
-* For real-network demand, mirror `NYCOrderGenerator`: snap each endpoint onto
-  the network with `network.snap(...)` / `network.node_coord(...)` so every
-  origin/destination lands on a reachable node, exactly as the graph-mode
-  movement model requires.
-
-The general recipe for **any city** is therefore: (1) build a graph for the
-region, (2) produce an order file/DataFrame whose coordinates fall inside that
-region, (3) load it through a generator that snaps onto the graph, (4) set the
-matching `network_kind`, paths and `horizon` in `BenchmarkConfig`.
-
----
-
-## Tests
+**Compare several trained RL checkpoints** (each is auto-named from its filename; the RL family — iddqn/mfddqn/bmgq — is inferred from the name):
 
 ```bash
-python -m pytest -q
+python -m benchmark.run_test \
+    --seed 42 \
+    --rl-ckpt iddqn/runs/<run>/checkpoints/iddqn_ep500.pt \
+    --rl-ckpt mfddqn/runs/<run>/checkpoints/mfddqn_ep500.pt \
+    --rl-ckpt bmgq/runs/<run>/checkpoints/bmgq_ep500.pt \
+    --windows 2 10
 ```
+
+Give a checkpoint an explicit display name with `--rl NAME CKPT` (repeatable), and dump per-method detailed records with `--out-dir results/test`. Run `python -m benchmark.run_test --help` for all options.
+
+# Citation
+
+```
+
+```
+

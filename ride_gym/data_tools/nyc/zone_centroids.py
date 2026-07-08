@@ -21,15 +21,20 @@ computed in this *projected* CRS (geometric centroid of a planar polygon); doing
 it in lon/lat would be geometrically wrong (geopandas even warns). We therefore
 compute the centroid first, THEN reproject the resulting points to EPSG:4326.
 
-Output
-------
-A CSV ``data/nyc/zone_centroids.csv`` with columns
+Input / output
+--------------
+Input: the taxi-zone shapefile, expected at
+``./dataset/taxi_zones/taxi_zones.shp`` (relative to the current working
+directory); download it separately (NYC TLC).
+Output: a CSV ``./data/nyc/zone_centroids.csv`` with columns
 ``LocationID, zone, borough, lon, lat`` and a convenience loader
 :func:`load_zone_centroids` returning a ``{location_id: (lon, lat)}`` dict.
 
 Run::
 
-    python -m data.nyc.zone_centroids
+    python -m ride_gym.data_tools.nyc.zone_centroids
+
+Requires the ``geopandas`` / ``pandas`` extras (``pip install ride_gym[data]``).
 """
 
 from __future__ import annotations
@@ -37,20 +42,29 @@ from __future__ import annotations
 import os
 from typing import Dict, Tuple
 
-import geopandas as gpd
-import pandas as pd
 
-_HERE = os.path.dirname(__file__)
-DEFAULT_SHP = os.path.join(
-    _HERE, "..", "..", "dataset", "taxi_zones", "taxi_zones.shp"
-)
-DEFAULT_OUT = os.path.join(_HERE, "zone_centroids.csv")
+def default_shp_path() -> str:
+    """Default input shapefile: ``./dataset/taxi_zones/taxi_zones.shp``."""
+    return os.path.join(os.getcwd(), "dataset", "taxi_zones", "taxi_zones.shp")
+
+
+def default_out_path() -> str:
+    """Default output CSV: ``./data/nyc/zone_centroids.csv`` under the cwd."""
+    return os.path.join(os.getcwd(), "data", "nyc", "zone_centroids.csv")
 
 
 def build_zone_centroids(
-    shp_path: str = DEFAULT_SHP, out_path: str = DEFAULT_OUT
+    shp_path: str | None = None, out_path: str | None = None
 ) -> str:
     """Compute zone centroids in lon/lat and write them to ``out_path``."""
+    # Lazy import: geopandas is a heavy, optional dependency.
+    import geopandas as gpd
+    import pandas as pd
+
+    shp_path = shp_path or default_shp_path()
+    out_path = out_path or default_out_path()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
     g = gpd.read_file(shp_path)
     # Centroid in the projected CRS (correct), then reproject the POINTS to 4326.
     cent_proj = g.geometry.centroid
@@ -77,9 +91,15 @@ def build_zone_centroids(
 
 
 def load_zone_centroids(
-    path: str = DEFAULT_OUT,
+    path: str | None = None,
 ) -> Dict[int, Tuple[float, float]]:
-    """Load the centroid CSV into a ``{LocationID: (lon, lat)}`` dict."""
+    """Load the centroid CSV into a ``{LocationID: (lon, lat)}`` dict.
+
+    ``path`` defaults to :func:`default_out_path` (``./data/nyc/zone_centroids.csv``).
+    """
+    import pandas as pd
+
+    path = path or default_out_path()
     df = pd.read_csv(path)
     return {
         int(r.LocationID): (float(r.lon), float(r.lat))

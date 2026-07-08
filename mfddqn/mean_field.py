@@ -57,16 +57,34 @@ class MeanFieldConfig:
 
     Attributes
     ----------
+    neighbour_mode:
+        How each driver's mean-field neighbourhood is selected:
+          * ``"knn"`` (default) -> the ``neighbours_k`` nearest drivers by
+            location (top-K; fixed neighbour count per driver).
+          * ``"radius"`` -> every OTHER driver within ``neighbour_radius_km``
+            kilometres (variable neighbour count; empty when isolated).
     neighbours_k:
-        Number of nearest spatial neighbours whose action embeddings are
-        averaged into each driver's mean field ``a_bar`` (top-K). The paper uses
-        a local neighbourhood; we use K = 30.
+        Neighbourhood size for ``neighbour_mode == "knn"`` (top-K). The paper
+        uses a local neighbourhood; we use K = 30.
+    neighbour_radius_km:
+        Neighbourhood radius in KILOMETRES for ``neighbour_mode == "radius"``.
+        Driver locations are converted to km via ``coord_to_km`` before the
+        distance test, so this is a true metric distance even on lon/lat
+        (NYC) coordinates. Default 1.0 km.
+    coord_to_km:
+        Per-axis scale ``(kx, ky)`` converting a coordinate delta to kilometres
+        (``dx_km = dx * kx``). For abstract km scenarios this is ``(1.0, 1.0)``;
+        for lon/lat (osmnx/nyc) the trainer passes the local
+        ``(111*cos(lat), 111)`` factors. Only used by the radius mode.
     iters:
         Number of fixed-point iterations (compute Q-matrix -> Hungarian ->
         rebuild a_bar). Mean field converges fast; 2 is a good default.
     """
 
+    neighbour_mode: str = "knn"
     neighbours_k: int = 30
+    neighbour_radius_km: float = 1.0
+    coord_to_km: Tuple[float, float] = (1.0, 1.0)
     iters: int = 2
     # Simplified variant: instead of solving the within-step fixed point, use
     # the mean field carried over from the PREVIOUS step (all-zeros at the first
@@ -112,6 +130,79 @@ def build_neighbour_lists(
         # Query k+1 because the driver itself is in the index; drop self below.
         found = index.nearest(driver_locs[i], k + 1, distance_fn=_eucl_sq)
         rows = [row_i for _d, row_i in found if row_i != i][:k]
+        neighbours.append(np.asarray(rows, dtype=np.int64))
+    return neighbours
+
+
+def build_neighbour_lists_radius(
+    driver_locs: List[Coord],
+    index,
+    radius_km: float,
+    coord_to_km: Tuple[float, float] = (1.0, 1.0),
+) -> List[np.ndarray]:
+    """Return, for each driver, the rows of all OTHER drivers within ``radius_km``.
+
+    The radius analogue of :func:`build_neighbour_lists`: instead of a fixed
+    top-K, a driver's neighbours are every other driver whose location is within
+    ``radius_km`` kilometres. Neighbour counts therefore vary per driver (and an
+    isolated driver gets an empty list, handled downstream as the dummy mean
+    field). Distances are measured in KILOMETRES by scaling the raw coordinate
+    delta through ``coord_to_km``, so the threshold is a true metric distance
+    even on lon/lat coordinates.
+
+    The shared :class:`GridIndex` is (re)built over the drivers and queried ring
+    by ring outward; we stop expanding once an entire ring lies wholly beyond
+    the radius (no closer point can appear farther out), keeping the query
+    local rather than O(N) per driver.
+
+    Parameters
+    ----------
+    driver_locs:
+        Row-ordered driver locations ``[(x, y), ...]`` (row i == matrix row i).
+    index:
+        A :class:`benchmark.spatial.GridIndex` to (re)build over the drivers.
+    radius_km:
+        Neighbourhood radius in kilometres.
+    coord_to_km:
+        Per-axis ``(kx, ky)`` factors converting a coordinate delta to km.
+    """
+    n = len(driver_locs)
+    loc_map = {i: driver_locs[i] for i in range(n)}
+    index.build(loc_map)
+    r_km = float(radius_km)
+    r_km_sq = r_km * r_km
+    kx, ky = float(coord_to_km[0]), float(coord_to_km[1])
+    cell = index.cell_size
+    # A ring at Chebyshev radius ``ring`` has its NEAREST point at least
+    # ``(ring - 1) * cell_size`` coordinate units away (in the closer axis).
+    # Convert that lower bound to km with the smaller per-axis factor (so we
+    # never stop too early) and stop once even the closest possible point in a
+    # ring exceeds the radius.
+    min_axis_km = max(min(abs(kx), abs(ky)), 1e-12)
+
+    def _dist_km_sq(a: Coord, b: Coord) -> float:
+        dx = (a[0] - b[0]) * kx
+        dy = (a[1] - b[1]) * ky
+        return dx * dx + dy * dy
+
+    max_ring = max(index._ncols, index._nrows)
+    neighbours: List[np.ndarray] = []
+    for i in range(n):
+        qi = driver_locs[i]
+        qcol, qrow = index._cell_of(qi)
+        rows: List[int] = []
+        ring = 0
+        while ring <= max_ring:
+            # Lower bound (km) on the distance to any point in THIS ring.
+            ring_min_km = (ring - 1) * cell * min_axis_km if ring > 0 else 0.0
+            if ring_min_km > r_km:
+                break  # this and all farther rings are entirely out of range
+            for item_id, coord in index._ring_items(qcol, qrow, ring):
+                if item_id == i:
+                    continue
+                if _dist_km_sq(qi, coord) <= r_km_sq:
+                    rows.append(item_id)
+            ring += 1
         neighbours.append(np.asarray(rows, dtype=np.int64))
     return neighbours
 

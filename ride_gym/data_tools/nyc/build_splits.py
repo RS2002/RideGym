@@ -1,14 +1,15 @@
 """Batch-generate multiple time-window order files for train/val/test splits.
 
-The single-window :mod:`data.nyc.preprocess_orders` produces ONE order file for
-ONE time window, which makes every training episode replay identical demand.
-This script slices the raw FHVHV parquet into MANY fixed-length windows grouped
-into disjoint train / val / test pools, so a multi-window order generator can:
+The single-window :mod:`ride_gym.data_tools.nyc.preprocess_orders` produces ONE
+order file for ONE time window, which makes every training episode replay
+identical demand. This script slices the raw FHVHV parquet into MANY
+fixed-length windows grouped into disjoint train / val / test pools, so a
+multi-window order generator can:
 
 * sample a RANDOM training window each episode (demand diversity / regularisation);
 * hold out separate windows for validation and test (no temporal leakage).
 
-Each window becomes one order parquet under ``data/nyc/splits/<split>/`` and a
+Each window becomes one order parquet under ``./data/nyc/splits/<split>/`` and a
 single ``manifest.json`` records, per split, the list of (file, start, end)
 windows so the generator can load them without rescanning the raw data.
 
@@ -22,11 +23,13 @@ DAYS never overlap -- the cleanest hold-out for a benchmark.
 
 Run::
 
-    python -m data.nyc.build_splits                 # use the defaults below
-    python -m data.nyc.build_splits --window-min 60 # 60-min windows
+    python -m ride_gym.data_tools.nyc.build_splits                 # defaults
+    python -m ride_gym.data_tools.nyc.build_splits --window-min 60 # 60-min windows
 
-Adjust ``TRAIN_DAYS`` / ``VAL_DAYS`` / ``TEST_DAYS`` and ``DAILY_WINDOWS`` to
-your dataset month and desired coverage.
+Outputs default to ``./data/nyc/splits/`` (relative to the cwd). Adjust
+``TRAIN_DAYS`` / ``VAL_DAYS`` / ``TEST_DAYS`` and ``DAILY_WINDOW_STARTS`` to your
+dataset month and desired coverage. Requires the ``pandas`` / ``pyarrow`` extras
+(``pip install ride_gym[data]``).
 """
 
 from __future__ import annotations
@@ -36,13 +39,11 @@ import json
 import os
 from typing import List, Tuple
 
-import pandas as pd
-
-from data.nyc.preprocess_orders import preprocess_orders, DEFAULT_PARQUET
-from data.nyc.build_nyc_network import REGION_A_BBOX
-
-_HERE = os.path.dirname(__file__)
-DEFAULT_SPLITS_DIR = os.path.join(_HERE, "splits")
+from ride_gym.data_tools.nyc.preprocess_orders import (
+    preprocess_orders,
+    default_parquet_path,
+)
+from ride_gym.data_tools.nyc.build_nyc_network import REGION_A_BBOX
 
 # ---------------------------------------------------------------------------
 # Split definition (EDIT THESE to match your data month / desired coverage).
@@ -50,20 +51,30 @@ DEFAULT_SPLITS_DIR = os.path.join(_HERE, "splits")
 # Disjoint day ranges guarantee no temporal leakage across splits. The dataset
 # bundled here is 2026-04 (April), so all dates are 2026-04-DD.
 # ---------------------------------------------------------------------------
-TRAIN_DAYS: List[str] = [f"2026-04-{d:02d}" for d in range(6, 9)]   # 1..20
-VAL_DAYS:   List[str] = [f"2026-04-{d:02d}" for d in range(9, 10)]  # 21..25
-TEST_DAYS:  List[str] = [f"2026-04-{d:02d}" for d in range(10, 11)]  # 26..30
+TRAIN_DAYS: List[str] = [f"2026-04-{d:02d}" for d in range(6, 13)]
+VAL_DAYS:   List[str] = [f"2026-04-{d:02d}" for d in range(13, 14)]
+TEST_DAYS:  List[str] = [f"2026-04-{d:02d}" for d in range(14, 15)]
 
 # Within each day, cut fixed-length windows starting at these "HH:MM" times.
 # Default: the morning peak split into hourly windows. Add more (e.g. "17:00",
 # "18:00") to cover the evening peak as well.
-DAILY_WINDOW_STARTS: List[str] = ["08:00", "09:00"]
+DAILY_WINDOW_STARTS: List[str] = [
+    "08:00", "09:00", "10:00", "11:00", "12:00", "13:00",
+    "14:00", "15:00", "16:00", "17:00", "18:00", "19:00",
+]
+
+
+def default_splits_dir() -> str:
+    """Default output directory: ``./data/nyc/splits`` under the cwd."""
+    return os.path.join(os.getcwd(), "data", "nyc", "splits")
 
 
 def _windows_for_days(
     days: List[str], starts: List[str], window_min: int
 ) -> List[Tuple[str, str]]:
     """Expand (days x daily-start-times) into concrete (start, end) timestamps."""
+    import pandas as pd
+
     out: List[Tuple[str, str]] = []
     for day in days:
         for hhmm in starts:
@@ -83,6 +94,8 @@ def _build_split(
     seed: int,
 ) -> List[dict]:
     """Generate one order file per window for a split; return its manifest list."""
+    import pandas as pd
+
     split_dir = os.path.join(splits_dir, split)
     os.makedirs(split_dir, exist_ok=True)
     entries: List[dict] = []
@@ -118,8 +131,8 @@ def _build_split(
 
 
 def build_splits(
-    splits_dir: str = DEFAULT_SPLITS_DIR,
-    parquet_path: str = DEFAULT_PARQUET,
+    splits_dir: str | None = None,
+    parquet_path: str | None = None,
     bbox: tuple = REGION_A_BBOX,
     window_min: int = 60,
     sample_rate: float = 1.0,
@@ -127,6 +140,8 @@ def build_splits(
 ) -> str:
     """Generate all train/val/test window order files + a manifest. Returns the
     manifest path."""
+    splits_dir = splits_dir or default_splits_dir()
+    parquet_path = parquet_path or default_parquet_path()
     os.makedirs(splits_dir, exist_ok=True)
     manifest = {
         "window_min": window_min,
@@ -158,8 +173,10 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description="Batch-generate train/val/test window order files."
     )
-    p.add_argument("--splits-dir", default=DEFAULT_SPLITS_DIR)
-    p.add_argument("--parquet", default=DEFAULT_PARQUET)
+    p.add_argument("--splits-dir", default=None,
+                   help="output dir (default: ./data/nyc/splits).")
+    p.add_argument("--parquet", default=None,
+                   help="raw FHVHV parquet (default: ./dataset/fhvhv_tripdata_2026-04.parquet).")
     p.add_argument("--window-min", type=int, default=60,
                    help="length of each window in minutes (default 60).")
     p.add_argument("--sample-rate", type=float, default=1.0)

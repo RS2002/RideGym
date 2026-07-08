@@ -21,7 +21,7 @@ import os
 import time
 from typing import Dict, List, Optional
 
-from ridepool_sim.enums import OrderStatus
+from ride_gym.enums import OrderStatus
 
 
 class EpisodeRecorder:

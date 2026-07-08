@@ -7,7 +7,12 @@ so different algorithms can be compared on identical conditions.
 
 from benchmark.config import BenchmarkConfig, make_benchmark_env
 from benchmark.recorder import EpisodeRecorder
-from benchmark.baselines import NearestDistanceDispatch, HungarianDispatch
+from benchmark.baselines import (
+    NearestDistanceDispatch,
+    HungarianDispatch,
+    RandomRadiusDispatch,
+    GaleShapleyDispatch,
+)
 from benchmark.runner import run_episode
 
 __all__ = [
@@ -16,5 +21,7 @@ __all__ = [
     "EpisodeRecorder",
     "NearestDistanceDispatch",
     "HungarianDispatch",
+    "RandomRadiusDispatch",
+    "GaleShapleyDispatch",
     "run_episode",
 ]

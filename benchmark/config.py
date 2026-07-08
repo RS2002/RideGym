@@ -23,10 +23,10 @@ import os
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Tuple
 
-from ridepool_sim.env import RidePoolEnv
-from ridepool_sim.order_generator import RandomOrderGenerator
-from ridepool_sim.rewards import DefaultRewardFunction
-from ridepool_sim.road_network import RoadNetwork, ManhattanNetwork
+from ride_gym.env import RidePoolEnv
+from ride_gym.order_generator import RandomOrderGenerator
+from ride_gym.rewards import DefaultRewardFunction
+from ride_gym.road_network import RoadNetwork, ManhattanNetwork
 
 Area = Tuple[float, float, float, float]
 Coord = Tuple[float, float]
@@ -63,12 +63,12 @@ class BenchmarkConfig:
     """
 
     area: Area = (0.0, 0.0, 10.0, 10.0)
-    num_drivers: int = 800
+    num_drivers: int = 1000
     num_orders: int = 15000
     horizon: float = 60.0
     dt: float = 1.0
-    speed_kmh: float = 40.0
-    driver_capacity: int = 3
+    speed_kmh: float = 35.0
+    driver_capacity: int = 4
     order_timeout: Optional[float] = 3.0
     passengers_per_order: int = 1
     arrival: str = "uniform"
@@ -77,10 +77,11 @@ class BenchmarkConfig:
     # "nyc"}). None -> the bundled default region (data/guomao.gpickle).
     osmnx_graph_path: Optional[str] = "data/guomao.gpickle"
     # Path to the cached Manhattan graph (used only when network_kind == "nyc");
-    # None -> data/nyc/manhattan.gpickle (built by data/nyc/build_nyc_network).
+        # None -> data/nyc/manhattan.gpickle (built by
+    # ride_gym.data_tools.nyc.build_nyc_network).
     nyc_graph_path: Optional[str] = "data/nyc/manhattan.gpickle"
-    # Path to the preprocessed NYC order file (used only when
-    # network_kind == "nyc"); produced by data/nyc/preprocess_orders.py.
+    # Path to the preprocessed NYC order file (used only when network_kind ==
+    # "nyc"); produced by ride_gym.data_tools.nyc.preprocess_orders.
     nyc_order_path: Optional[str] = "data/nyc/orders.parquet"
     # Optional cap on the number of NYC orders loaded (None = all).
     nyc_order_limit: Optional[int] = None
@@ -92,7 +93,7 @@ class BenchmarkConfig:
     # ``<nyc_splits_dir>/<nyc_split>/`` recorded in the split manifest. This is
     # how a single config switches between training (random window each episode)
     # and held-out validation / test windows.
-    #   nyc_splits_dir : directory produced by data/nyc/build_splits.py
+    #   nyc_splits_dir : directory produced by ride_gym.data_tools.nyc.build_splits
     #                    (contains manifest.json + train/val/test/ subdirs).
     #                    None (default) -> use the single nyc_order_path file.
     #   nyc_split      : which pool to draw from -- "train" (random window per
@@ -106,8 +107,8 @@ class BenchmarkConfig:
     # each order draws a passenger count uniformly in [1, max_party_size]
     # (default 1..3), making pooling non-trivial. Reproducible per episode
     # via the env seed and re-randomised across episodes.
-    random_party_size: bool = False
-    max_party_size: int = 3
+    random_party_size: bool = True
+    max_party_size: int = 4
 
     # --- OD spatial perturbation (NYC scenarios) --------------------------
     # NYC orders are located by taxi-zone CENTROID, so every order in a zone
@@ -197,7 +198,7 @@ class BenchmarkConfig:
     #            none within capacity / candidate set). Mirrored identically in
     #            the Q-target computation. Threaded into every matching-based
     #            method (iddqn, bmg-q, mfddqn).
-    allow_idle: bool = False
+    allow_idle: bool = True
 
     seed: int = 0
 
@@ -218,7 +219,7 @@ def _make_network(cfg: BenchmarkConfig) -> RoadNetwork:
     if cfg.network_kind == "manhattan":
         return ManhattanNetwork(speed=speed)
     if cfg.network_kind == "euclidean":
-        from ridepool_sim.road_network import EuclideanNetwork
+        from ride_gym.road_network import EuclideanNetwork
 
         return EuclideanNetwork(speed=speed)
     if cfg.network_kind == "osmnx":
@@ -226,7 +227,7 @@ def _make_network(cfg: BenchmarkConfig) -> RoadNetwork:
         # metres and travel times honour per-segment speeds (the scalar
         # ``speed_kmh`` is ignored). Building precomputes the all-pairs matrices
         # once. The graph path can be overridden via ``osmnx_graph_path``.
-        from ridepool_sim.osmnx_network import OSMnxNetwork, DEFAULT_GRAPH
+        from ride_gym.osmnx_network import OSMnxNetwork, DEFAULT_GRAPH
 
         return OSMnxNetwork(
             graph_path=cfg.osmnx_graph_path or DEFAULT_GRAPH,
@@ -236,11 +237,13 @@ def _make_network(cfg: BenchmarkConfig) -> RoadNetwork:
         # Real Manhattan road network for the NYC FHVHV scenario. Same backend
         # as "osmnx" but pointed at the cached Manhattan graph; demand comes
         # from real historical trips (see make_benchmark_env).
-        from ridepool_sim.osmnx_network import OSMnxNetwork
-        from data.nyc.build_nyc_network import DEFAULT_OUT as NYC_GRAPH
+        from ride_gym.osmnx_network import OSMnxNetwork
+        from ride_gym.data_tools.nyc.build_nyc_network import (
+            default_out_path as _nyc_graph_default,
+        )
 
         return OSMnxNetwork(
-            graph_path=cfg.nyc_graph_path or NYC_GRAPH,
+            graph_path=cfg.nyc_graph_path or _nyc_graph_default(),
             speed_kmh=cfg.speed_kmh,
         )
     raise ValueError(f"Unknown network_kind: {cfg.network_kind!r}")
@@ -257,7 +260,7 @@ def nyc_zone_centroids(area: Optional[Area] = None) -> List[Coord]:
 
         env = make_benchmark_env(cfg, relocation_centroids=nyc_zone_centroids(cfg.area))
     """
-    from data.nyc.zone_centroids import load_zone_centroids
+    from ride_gym.data_tools.nyc.zone_centroids import load_zone_centroids
 
     centroids = load_zone_centroids()
     pts = list(centroids.values())
@@ -272,17 +275,19 @@ def nyc_zone_centroids(area: Optional[Area] = None) -> List[Coord]:
 def load_split_window_paths(splits_dir: str, split: str) -> List[str]:
     """Return the window order-file paths for a split from its manifest.
 
-    Reads <splits_dir>/manifest.json (written by data/nyc/build_splits.py)
-    and returns the absolute paths of every window order file for ``split``
+        Reads <splits_dir>/manifest.json (written by
+    ride_gym.data_tools.nyc.build_splits) and returns the absolute paths of
+    every window order file for ``split``
     ("train"|"val"|"test"). Paths are stored relative to splits_dir.
     """
     import json
 
     manifest_path = os.path.join(splits_dir, "manifest.json")
     if not os.path.exists(manifest_path):
-        raise FileNotFoundError(
+                raise FileNotFoundError(
             f"split manifest not found: {manifest_path!r}. Run "
-            f"`python -m data.nyc.build_splits` first to generate windows."
+            f"`python -m ride_gym.data_tools.nyc.build_splits` first to "
+            f"generate windows."
         )
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
@@ -323,7 +328,7 @@ def make_benchmark_env(
         # order endpoints are sampled on real nodes (guaranteed reachable). The
         # env is given the SAME network instance so its precomputed matrices /
         # snap cache are shared, not rebuilt.
-        from ridepool_sim.order_generator import OSMnxOrderGenerator
+        from ride_gym.order_generator import OSMnxOrderGenerator
 
         area = network.bounds
         order_gen = OSMnxOrderGenerator(
@@ -358,7 +363,7 @@ def make_benchmark_env(
             # time windows recorded in the split manifest. Training draws a
             # random window per episode; val/test traverse held-out windows
             # deterministically.
-            from ridepool_sim.order_generator import MultiWindowNYCOrderGenerator
+            from ride_gym.order_generator import MultiWindowNYCOrderGenerator
 
             window_paths = load_split_window_paths(
                 cfg.nyc_splits_dir, cfg.nyc_split
@@ -376,12 +381,14 @@ def make_benchmark_env(
             )
         else:
             # Single-file mode: deterministic replay of one preprocessed window.
-            from ridepool_sim.order_generator import NYCOrderGenerator
-            from data.nyc.preprocess_orders import DEFAULT_OUT as NYC_ORDERS
+            from ride_gym.order_generator import NYCOrderGenerator
+            from ride_gym.data_tools.nyc.preprocess_orders import (
+                default_out_path as _nyc_orders_default,
+            )
 
             order_gen = NYCOrderGenerator(
                 network=network,
-                order_path=cfg.nyc_order_path or NYC_ORDERS,
+                order_path=cfg.nyc_order_path or _nyc_orders_default(),
                 horizon=cfg.horizon,
                 limit=cfg.nyc_order_limit,
                 random_party_size=cfg.random_party_size,

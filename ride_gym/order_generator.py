@@ -15,7 +15,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 from math import cos as _math_cos, sin as _math_sin
 
-from ridepool_sim.entities import Order
+from ride_gym.entities import Order
 
 Area = Tuple[float, float, float, float]  # (xmin, ymin, xmax, ymax)
 
@@ -149,10 +149,10 @@ class OSMnxOrderGenerator(OrderGenerator):
     times follow the same ``uniform`` / ``poisson`` / ``peak`` distributions as
     :class:`RandomOrderGenerator`.
 
-    Parameters
+        Parameters
     ----------
     network:
-        An :class:`~ridepool_sim.osmnx_network.OSMnxNetwork` providing the node
+        An :class:`~ride_gym.osmnx_network.OSMnxNetwork` providing the node
         set to sample real ``(lon, lat)`` coordinates from.
     horizon:
         Total simulation duration in minutes.
@@ -279,7 +279,8 @@ class DataFrameOrderGenerator(OrderGenerator):
 class NYCOrderGenerator(OrderGenerator):
     """Build orders from a preprocessed NYC FHVHV order file, snapped to a graph.
 
-    The order file (produced by ``data/nyc/preprocess_orders.py``) already holds
+    The order file (produced by ``ride_gym.data_tools.nyc.preprocess_orders``)
+    already holds
     real trips as ``origin_x/origin_y/dest_x/dest_y`` (zone-centroid lon/lat),
     ``request_time`` (minutes from the episode start) and ``num_passengers``.
     Because those coordinates are zone CENTROIDS they need not sit exactly on a
@@ -295,10 +296,10 @@ class NYCOrderGenerator(OrderGenerator):
     ``env.reset(seed=...)`` works uniformly) but is a no-op, since there is no
     randomness to reseed.
 
-    Parameters
+        Parameters
     ----------
     network:
-        An :class:`~ridepool_sim.osmnx_network.OSMnxNetwork` (or any network
+        An :class:`~ride_gym.osmnx_network.OSMnxNetwork` (or any network
         exposing ``snap`` + ``node_coord``) covering the order region; used to
         snap each endpoint onto a real road node.
     order_path:
@@ -306,12 +307,8 @@ class NYCOrderGenerator(OrderGenerator):
         suffix is ``.parquet``; anything else is read as CSV.
     horizon:
         Episode duration in minutes. Orders whose ``request_time`` is at/after
-        the horizon are dropped (they could never be injected).
-
-
-
-
-        limit:
+                the horizon are dropped (they could never be injected).
+    limit:
         Optional cap on the number of orders (earliest-by-request_time kept).
         ``None`` (default) keeps them all.
     random_party_size:
@@ -360,13 +357,9 @@ class NYCOrderGenerator(OrderGenerator):
         """Reseed the party-size RNG (used by env.reset(seed=...)).
 
         The trips / times themselves remain deterministic (historical replay);
-        only the random party-size draw -- when ``random_party_size`` is enabled
+                only the random party-size draw -- when ``random_party_size`` is enabled
         -- is reseeded, so each episode gets a fresh but reproducible set of
-
-
-
-
-                party sizes. A no-op effect on the demand layout when the feature is
+        party sizes. A no-op effect on the demand layout when the feature is
         off.
         """
         self._rng = np.random.default_rng(rng)
@@ -469,9 +462,9 @@ class MultiWindowNYCOrderGenerator(OrderGenerator):
     """Multi-time-window NYC order source for train / val / test splits.
 
     Wraps a POOL of preprocessed NYC order files (each one a single time window
-    produced by ``data/nyc/build_splits.py``) and, on every :meth:`generate`
-    (i.e. every ``env.reset``), serves the orders of ONE window. The window is
-    chosen according to ``mode``:
+        produced by ``ride_gym.data_tools.nyc.build_splits``) and, on every
+    :meth:`generate` (i.e. every ``env.reset``), serves the orders of ONE
+    window. The window is chosen according to ``mode``:
 
     * ``"train"``  : a RANDOM window is drawn from the pool each episode, so the
       agent sees diverse demand patterns across episodes (regularisation /
@@ -484,9 +477,9 @@ class MultiWindowNYCOrderGenerator(OrderGenerator):
       held-out windows in a fixed, repeatable order -- no leakage from training
       windows, and identical evaluation conditions across runs.
 
-    Because the underlying windows are disjoint day ranges (see
-    :mod:`data.nyc.build_splits`), train / val / test never share demand, giving
-    a clean temporal hold-out for benchmarking.
+            Because the underlying windows are disjoint day ranges (see
+    :mod:`ride_gym.data_tools.nyc.build_splits`), train / val / test never share
+    demand, giving a clean temporal hold-out for benchmarking.
 
     All snapping / horizon-clipping logic is delegated to an internal
     :class:`NYCOrderGenerator` rebuilt per window, so endpoints are snapped onto
@@ -498,9 +491,9 @@ class MultiWindowNYCOrderGenerator(OrderGenerator):
         The :class:`OSMnxNetwork` covering the order region (shared with the
         env so the snap cache / matrices are reused).
     order_paths:
-        List of preprocessed window order files (parquet/csv) forming the pool
+                List of preprocessed window order files (parquet/csv) forming the pool
         for this split. Typically read from the split manifest written by
-        :mod:`data.nyc.build_splits`.
+        :mod:`ride_gym.data_tools.nyc.build_splits`.
     horizon:
         Episode duration in minutes (orders at/after it are dropped per window).
     mode:
@@ -559,7 +552,7 @@ class MultiWindowNYCOrderGenerator(OrderGenerator):
         """Select the window index for this episode per the mode."""
         if self.mode == "train":
             return int(self._rng.integers(0, len(self.order_paths)))
-                # val/test: deterministic cyclic traversal.
+        # val/test: deterministic cyclic traversal.
         idx = self._cursor % len(self.order_paths)
         self._cursor += 1
         return idx

@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from ridepool_sim.enums import DriverStatus, OrderStatus
+from ride_gym.enums import DriverStatus, OrderStatus
 
 Coord = Tuple[float, float]
 

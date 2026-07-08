@@ -49,7 +49,7 @@ class BMGTrainConfig:
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
 
     # Optimisation / agent.
-    gamma: float = 0.9998
+    gamma: float = 0.99
     lr: float = 5e-4
     batch_size: int = 8
     tau: float = 0.005
@@ -58,7 +58,7 @@ class BMGTrainConfig:
     hidden: tuple = (128,)
 
     # GAT specifics.
-    neighbours_k: int = 20
+    neighbours_k: int = 30
     embed_dim: int = 64
     num_heads: int = 1
     gat_layers: int = 1
@@ -83,11 +83,11 @@ class BMGTrainConfig:
     # Exploration anneal.
     anneal_t0: float = 1.0
     anneal_mode: str = "exponential"
-    anneal_decay: float = 0.99
+    anneal_decay: float = 0.9998
     anneal_decay_steps: int = 20_000
     anneal_t_min: float = 0.001
     noise_coef: float = 1.0
-    scale_stat: str = "std"
+    scale_stat: str = "std"  # "std" or "mean_abs"
     scale_floor: float = 1e-3
 
     # Candidate pruning (kept for parity; dense by default).

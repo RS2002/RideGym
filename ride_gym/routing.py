@@ -20,8 +20,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple
 
-from ridepool_sim.entities import TaskPoint
-from ridepool_sim.road_network import RoadNetwork
+from ride_gym.entities import TaskPoint
+from ride_gym.road_network import RoadNetwork
 
 Coord = Tuple[float, float]
 

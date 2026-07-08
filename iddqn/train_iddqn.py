@@ -29,6 +29,7 @@ from benchmark.runner import run_episode
 
 from iddqn.features import FeatureConfig, FeatureEncoder
 from iddqn.qnet import PairQNet
+from iddqn.cv_qnet import CVNet, HEX_DEFAULT_RESOLUTIONS
 from iddqn.inference import IDDQNActor
 from iddqn.assignment_net import AssignmentNet
 from iddqn.assignment_inference import AssignmentActor
@@ -44,7 +45,7 @@ class TrainConfig:
 
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
 
-    gamma: float = 0.9998
+    gamma: float = 0.99
     lr: float = 5e-4
     batch_size: int = 8
     tau: float = 0.005
@@ -52,10 +53,33 @@ class TrainConfig:
     grad_clip: float = 1.0
     hidden: tuple = (128, 128)
 
-    net_arch: str = "mlp"
+    net_arch: str = "assignment"
     embed_dim: int = 64
     tf_heads: int = 4
     max_seq_len: int = 6
+
+    # --- CV-Net (net_arch == "cvnet") multi-scale position embedding ---------
+    # Spatial-cell SHAPE for the position embedding:
+    #   "square" -> axis-aligned square grids (cv_resolutions below);
+    #   "hex"    -> H3-style pointy-top hexagonal grids (cv_hex_* below), each
+    #              level 1/7 the area of its parent. Hexagons are equidistant to
+    #              all six neighbours (isotropic generalisation), as in the
+    #              original CV-Net paper -- unlike squares whose diagonal
+    #              neighbours are sqrt(2) farther.
+    cv_grid_type: str = "hex"
+    # (square only) Cells-per-axis of the small / medium / high-granularity
+    # grids. A location is discretised on each grid and its per-grid embeddings
+    # are averaged into one position embedding (see iddqn.cv_qnet.CVNet).
+    cv_resolutions: tuple = (4, 7, 10)
+        # (hex only) Per-level hexagons-per-axis (coarse -> fine), the hex analogue
+    # of cv_resolutions. Default (4, 4*sqrt(7), 28) ~= (4, 10.58, 28) bakes in
+    # the paper's H3-style 1/7-area hierarchy (each level sqrt(7)x the per-axis
+    # resolution -> 1/7 the hex area); override with any resolutions you like.
+    cv_hex_resolutions: tuple = HEX_DEFAULT_RESOLUTIONS
+    # Per-grid / per-level position-embedding width.
+    cv_pos_embed_dim: int = 32
+    # Multi-scale aggregation: "mean" (default) or "concat".
+    cv_aggregate: str = "mean"
 
     replay_capacity: int = 6_000
     warmup_snapshots: int = 120
@@ -73,11 +97,11 @@ class TrainConfig:
 
     anneal_t0: float = 1.0
     anneal_mode: str = "exponential"
-    anneal_decay: float = 0.99
+    anneal_decay: float = 0.9998
     anneal_decay_steps: int = 20_000
     anneal_t_min: float = 0.001
     noise_coef: float = 1.0
-    scale_stat: str = "std"
+    scale_stat: str = "std"  # "std" or "mean_abs"
     scale_floor: float = 1e-3
 
     use_knn: bool = False
@@ -180,6 +204,26 @@ class IDDQNTrainer:
                 tf_heads=cfg.tf_heads,
             )
             self.agent = AssignmentAgent(net, agent_cfg)
+        elif cfg.net_arch == "cvnet":
+            # CV-Net: same two-tower matching pipeline as the MLP path, but
+            # positions are encoded by multi-scale grid embeddings instead of
+            # raw continuous values. Reuses IDDQNAgent unchanged (drop-in for
+            # PairQNet).
+            self.agent = IDDQNAgent(
+                self.fc.pair_dim,
+                agent_cfg,
+                                qnet=CVNet(
+                    self.fc.pair_dim,
+                    driver_dim=self.fc.driver_dim,
+                                        grid_type=cfg.cv_grid_type,
+                    resolutions=cfg.cv_resolutions,
+                    hex_resolutions=cfg.cv_hex_resolutions,
+                    pos_embed_dim=cfg.cv_pos_embed_dim,
+                    hidden=cfg.hidden,
+                    embed_dim=cfg.embed_dim,
+                    aggregate=cfg.cv_aggregate,
+                ),
+            )
         else:
                 self.agent = IDDQNAgent(
                 self.fc.pair_dim,
