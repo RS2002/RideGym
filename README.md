@@ -1,6 +1,6 @@
 # RideGym
 
-**Article:** Zijian Zhao, Yulong Hu, Sen Li*, "RideGym: A Standardized Interface for Real-World Large-Scale Ride-Sharing System" (in preperation)
+**Article:** Zijian Zhao, Yulong Hu, Sen Li*, "[RideGym: A Standardized Interface for Real-World Large-Scale Ride-Sharing System](https://arxiv.org/abs/2607.10173)" (in preperation)
 
 [ride-gym · PyPI](https://pypi.org/project/ride-gym/) is a Gym-like (but not Gym-dependent) simulation environment for large-scale ride-pooling and order dispatching.
 
@@ -284,6 +284,14 @@ Give a checkpoint an explicit display name with `--rl NAME CKPT` (repeatable), a
 # Citation
 
 ```
-
+@misc{zhao2026ridegym,
+      title={RideGym: A Standardized Interface for Real-World Large-Scale Ride-Sharing System}, 
+      author={Zijian Zhao and Yulong Hu and Sen Li},
+      year={2026},
+      eprint={2607.10173},
+      archivePrefix={arXiv},
+      primaryClass={cs.MA},
+      url={https://arxiv.org/abs/2607.10173}, 
+}
 ```
 
