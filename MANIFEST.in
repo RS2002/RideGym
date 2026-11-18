@@ -1,0 +1,8 @@
+# Keep the source distribution limited to the standalone simulator.
+global-exclude *
+include pyproject.toml
+include MANIFEST.in
+include README_PYPI.md
+include LICENSE
+recursive-include ride_gym *.py
+global-exclude __pycache__ *.py[cod]

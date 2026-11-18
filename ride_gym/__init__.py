@@ -53,7 +53,7 @@ from ride_gym.response import (
 )
 from ride_gym.warmup import capture_state, restore_state, save_snapshot, load_snapshot
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "DriverStatus",

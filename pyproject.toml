@@ -1,20 +1,51 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ride-gym"
 dynamic = ["version"]
 description = "A multi-agent ride-pooling and dispatch simulation environment"
-readme = "README.md"
+readme = "README_PYPI.md"
 requires-python = ">=3.9"
-dependencies = ["numpy>=1.20"]
+dependencies = ["numpy>=1.21"]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Zijian Zhao"},
+    {name = "Yulong Hu"},
+    {name = "Sen Li"},
+]
+keywords = [
+    "reinforcement-learning", "ride-pooling", "ride-hailing", "simulation",
+    "multi-agent", "gym", "dispatching", "transportation",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/RS2002/RideGym"
+Repository = "https://github.com/RS2002/RideGym"
+Issues = "https://github.com/RS2002/RideGym/issues"
 
 [project.optional-dependencies]
-osmnx = ["networkx", "osmnx"]
-data = ["pandas", "pyarrow", "geopandas", "osmnx"]
-viz = ["matplotlib", "pillow", "imageio"]
-all = ["networkx", "osmnx", "pandas", "pyarrow", "geopandas", "matplotlib", "pillow", "imageio"]
+osmnx = ["networkx>=2.6", "osmnx>=1.3"]
+data = ["pandas>=1.3", "pyarrow>=6.0", "geopandas>=0.10", "osmnx>=1.3", "networkx>=2.6"]
+viz = ["matplotlib>=3.4", "pillow", "imageio"]
+dev = ["pytest>=7.0"]
+all = ["networkx>=2.6", "osmnx>=1.3", "pandas>=1.3", "pyarrow>=6.0", "geopandas>=0.10", "matplotlib>=3.4", "pillow", "imageio"]
+
+[tool.setuptools]
+include-package-data = false
 
 [tool.setuptools.dynamic]
 version = {attr = "ride_gym.__version__"}

@@ -25,7 +25,7 @@ A fleet of vehicles serves a stream of ride requests that arrive over time, with
 
 # Part 1 — The `ride_gym` environment
 
-The simulator is published on PyPI and can be used entirely on its own (no benchmark code required).
+The simulator is published on PyPI and can be used entirely on its own (no benchmark code required). The wheel and source distribution contain the `ride_gym` package; benchmark and training code remain in this repository. See [the package guide](README_PYPI.md) for the standalone simulator documentation.
 
 ## Installation
 
@@ -36,10 +36,10 @@ pip install ride-gym
 The core only needs `numpy`. Install extras as needed:
 
 ```bash
-pip install ride-gym[data]     # pandas/pyarrow/geopandas/osmnx: build & preprocess real demand
-pip install ride-gym[osmnx]    # real OpenStreetMap road networks
-pip install ride-gym[viz]      # matplotlib: rendering & animation
-pip install ride-gym[all]      # everything
+pip install 'ride-gym[data]'     # pandas/pyarrow/geopandas/osmnx: build & preprocess real demand
+pip install 'ride-gym[osmnx]'    # real OpenStreetMap road networks
+pip install 'ride-gym[viz]'      # matplotlib: rendering & animation
+pip install 'ride-gym[all]'      # everything
 ```
 
 Requires Python >= 3.9.
@@ -170,7 +170,7 @@ Each vehicle is drawn in its own color, with its current location, planned route
 
 ## Optional simulation features
 
-The extensions below are available in this source tree; install the cloned repository with `pip install .` to use them. They are opt-in. Existing constructor arguments, actions, return values and default observation fields remain compatible. Omitting the new options preserves the original immediate-assignment behavior and seeded random sequence. Acceptance and response timing use separate random streams.
+The extensions below are available in `ride-gym` version 0.2.0 and later; install them with `pip install --upgrade ride-gym`, or install this source tree with `pip install .`. They are opt-in. Existing constructor arguments, actions, return values and default observation fields remain compatible. Omitting the new options preserves the original immediate-assignment behavior and seeded random sequence. Acceptance and response timing use separate random streams.
 
 All simulation times are **minutes from episode start**, except response-policy durations, which are explicitly **seconds**. Coordinates and speeds follow the selected network: speed is in network distance units per minute. A `vehicle_type` is a user-defined label; it does not silently select a calibrated speed or capacity.
 

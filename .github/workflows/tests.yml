@@ -20,3 +20,10 @@ jobs:
       - run: python -m pip install .
       - run: python -m unittest discover -s tests -v
       - run: python -m examples.optional_features
+      - name: Check standalone distributions
+        if: matrix.python == '3.12'
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python .github/scripts/verify_distribution.py dist/*.whl dist/*.tar.gz
+          python -m twine check --strict dist/*.whl dist/*.tar.gz
