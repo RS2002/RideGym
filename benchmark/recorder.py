@@ -102,13 +102,15 @@ class EpisodeRecorder:
             n_completed = len(ev["completed_orders"])
             n_pickups = len(ev["picked_up_orders"])
             dist = ev["distance_moved"]
+            empty_dist = ev.get(
+                "empty_distance_moved", dist if ev["is_empty_move"] else 0.0
+            )
 
             step_assigned += n_assigned
             step_completed += n_completed
             step_pickups += n_pickups
             step_distance += dist
-            if ev["is_empty_move"]:
-                step_empty_distance += dist
+            step_empty_distance += empty_dist
 
             acc = self._driver_acc.setdefault(
                 did,
@@ -125,8 +127,7 @@ class EpisodeRecorder:
             acc["orders_served"] += n_completed
             acc["orders_assigned"] += n_assigned
             acc["total_distance"] += dist
-            if ev["is_empty_move"]:
-                acc["empty_distance"] += dist
+            acc["empty_distance"] += empty_dist
             if ev["is_idle_wait"]:
                 acc["idle_steps"] += 1
             else:
@@ -188,13 +189,19 @@ class EpisodeRecorder:
             # Detour time: how much longer the passenger spent in the vehicle
             # than a direct, non-pooled trip would have taken. The direct ride
             # time is the straight (no-detour) travel time for the order's
-            # origin->destination distance at network speed; the realised
+            # origin->destination distance at the assigned vehicle's speed;
+            # the realised
             # ``ride_time`` exceeds it whenever pooling inserts other stops.
             # Only defined for completed trips (needs both pickup & dropoff);
             # clamped at zero to absorb tiny numerical/discretisation noise.
             detour_time = None
             if ride_time is not None:
-                direct_ride_time = env.network.travel_time(direct_dist)
+                driver = env.drivers.get(o.assigned_driver)
+                direct_ride_time = (
+                    direct_dist / env._driver_speed(driver)
+                    if driver is not None and driver.speed is not None
+                    else env.network.travel_time(direct_dist)
+                )
                 detour_time = max(0.0, ride_time - direct_ride_time)
 
             rows.append(

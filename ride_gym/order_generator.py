@@ -241,7 +241,11 @@ class DataFrameOrderGenerator(OrderGenerator):
 
     The frame must contain the columns named by ``columns`` mapping. Defaults
     expect: ``origin_x, origin_y, dest_x, dest_y, request_time`` and an optional
-    ``num_passengers`` (defaults to 1 when absent).
+    ``num_passengers`` (defaults to 1 when absent). Explicitly mapping
+    ``ready_time`` in ``columns`` enables an earliest pickup minute; missing
+    values mean ready on request. Extra columns are ignored by default. Existing
+    sorted zero-based ids are retained unless ``columns`` explicitly maps
+    ``order_id`` to a column containing unique integer ids.
     """
 
     DEFAULT_COLUMNS = {
@@ -251,7 +255,7 @@ class DataFrameOrderGenerator(OrderGenerator):
         "dest_y": "dest_y",
         "request_time": "request_time",
         "num_passengers": "num_passengers",
-        }
+    }
 
     def __init__(self, dataframe, columns: Optional[dict] = None):
         self.df = dataframe
@@ -260,20 +264,57 @@ class DataFrameOrderGenerator(OrderGenerator):
     def generate(self) -> List[Order]:
         c = self.columns
         df = self.df.sort_values(c["request_time"]).reset_index(drop=True)
-        has_party = c["num_passengers"] in df.columns
-        orders: List[Order] = []
-        for i, row in df.iterrows():
-            party = int(row[c["num_passengers"]]) if has_party else 1
-            orders.append(
-                Order(
+        if c.get("ready_time") is None and c.get("order_id") is None:
+            # Preserve the pre-extension path, including conversion behavior,
+            # unless the caller explicitly enables a new column mapping.
+            has_party = c["num_passengers"] in df.columns
+            orders = []
+            for i, row in df.iterrows():
+                party = int(row[c["num_passengers"]]) if has_party else 1
+                orders.append(Order(
                     order_id=int(i),
                     origin=(float(row[c["origin_x"]]), float(row[c["origin_y"]])),
                     destination=(float(row[c["dest_x"]]), float(row[c["dest_y"]])),
-                    request_time=float(row[c["request_time"]]),
-                    num_passengers=party,
-                )
-            )
+                    request_time=float(row[c["request_time"]]), num_passengers=party))
+            return orders
+        from ride_gym.data_tools.csv_io import _order_from_mapping
+
+        if c.get("order_id") is not None and c["order_id"] not in df.columns:
+            raise ValueError("mapped order_id column is absent from the DataFrame")
+        orders: List[Order] = []
+        seen = set()
+        for i in range(len(df)):
+            # Index each column separately: iterrows may cast an integer id to
+            # float when the row also contains floating-point coordinates.
+            record = {column: df[column].iloc[int(i)] for column in c.values()
+                      if column is not None and column in df.columns}
+            order = _order_from_mapping(record, c, int(i))
+            if order.order_id in seen:
+                raise ValueError("DataFrame contains duplicate order_id values")
+            seen.add(order.order_id)
+            orders.append(order)
         return orders
+
+
+class CsvOrderGenerator(OrderGenerator):
+    """Read a public order CSV without requiring pandas.
+
+    ``columns`` maps standard field names to custom column names. Times are
+    relative minutes unless an explicit aware datetime/ISO ``time_origin`` is
+    supplied; timestamp columns must then use that origin's UTC offset. Each
+    ``generate()`` rereads the file and creates fresh mutable Order instances.
+    See :func:`ride_gym.data_tools.csv_io.read_order_csv` for the full schema.
+    """
+
+    def __init__(self, path, columns=None, time_origin=None):
+        self.path = path
+        self.columns = None if columns is None else dict(columns)
+        self.time_origin = time_origin
+
+    def generate(self) -> List[Order]:
+        from ride_gym.data_tools.csv_io import read_order_csv
+
+        return read_order_csv(self.path, self.columns, self.time_origin)
 
 
 class NYCOrderGenerator(OrderGenerator):

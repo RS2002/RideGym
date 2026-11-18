@@ -41,7 +41,9 @@ class RoutesPlanner(ABC):
         Parameters
         ----------
         start:
-            The driver's current location.
+            The reroutable start position. For a graph vehicle mid-edge, the
+            environment supplies that edge's endpoint and accounts for the
+            remaining edge travel before the planned route.
         task_points:
             Unordered remaining stops. May contain pickups whose dropoff is
             also present, or lone dropoffs (order already picked up).
@@ -49,6 +51,20 @@ class RoutesPlanner(ABC):
             Road network used to measure distances between stops.
         """
         raise NotImplementedError
+
+    def plan_with_times(self, start, task_points, network):
+        """Compatibility fallback for planners implementing only ``plan``.
+
+        Arrival times are travel-only minutes from ``start``. Implementations
+        may override this method to compute the same information more cheaply.
+        """
+        ordered = self.plan(start, task_points, network)
+        current, elapsed, times = start, 0.0, {}
+        for stop in ordered:
+            elapsed += network.travel_time(network.distance(current, stop.location))
+            times.setdefault(stop.order_id, {})[stop.kind] = elapsed
+            current = stop.location
+        return ordered, times
 
 
 class GreedyInsertionPlanner(RoutesPlanner):

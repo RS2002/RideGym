@@ -34,20 +34,21 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 
-from ride_gym.entities import Driver, Order, TaskPoint
+from ride_gym.entities import Driver, Order
 from ride_gym.enums import DriverStatus, OrderStatus
 from ride_gym.exceptions import ConflictError, InvalidActionError
 from ride_gym.order_generator import OrderGenerator, RandomOrderGenerator
 from ride_gym.rewards import DefaultRewardFunction, RewardFunction
 from ride_gym.road_network import EuclideanNetwork, RoadNetwork
 from ride_gym.routing import GreedyInsertionPlanner, RoutesPlanner
+from ride_gym.runtime import RuntimeExtensions
 
 Coord = Tuple[float, float]
 Area = Tuple[float, float, float, float]
 RelocateTarget = Union[int, Coord]
 
 
-class RidePoolEnv:
+class RidePoolEnv(RuntimeExtensions):
     """Multi-agent ride-pooling and relocation simulation environment."""
 
     def __init__(
@@ -70,6 +71,16 @@ class RidePoolEnv:
         relocation_adjacency: int = 8,
         relocation_neighbours_k: int = 8,
         seed: Optional[int] = None,
+        *,
+        labor_source=None,
+        shift_policy=None,
+        initial_state=None,
+        acceptance_policy=None,
+        acceptance_seed: Optional[int] = None,
+        response_time_policy=None,
+        response_seed: Optional[int] = None,
+        validate_order_coords: bool = False,
+        statistics_granularity: str = "decision",
     ):
         """Configure the environment.
 
@@ -91,7 +102,7 @@ class RidePoolEnv:
             minute), length ``num_drivers``. ``None`` (default) makes every
             vehicle inherit the road network's default speed (homogeneous
             fleet); a per-vehicle value is used in place of ``network.speed``
-            in the movement model.
+            in movement, route prediction and travel-time reward baselines.
         dt:
             Time-step length in minutes.
         horizon:
@@ -132,6 +143,27 @@ class RidePoolEnv:
             *centroid* model. Ignored for the grid model.
         seed:
             Base RNG seed for reproducibility.
+        labor_source / shift_policy:
+            Optional explicit fleet and availability policy. Shift times use
+            minutes from episode start; existing commitments drain off duty.
+        initial_state:
+            Optional snapshot returned by ``capture_initial_state()``.
+        acceptance_policy / response_time_policy:
+            Optional invitation probability and response-duration policies.
+            ``None`` preserves immediate, unconditional assignment. Duration
+            policies return seconds; the environment clock remains minutes.
+        acceptance_seed / response_seed:
+            Seeds for independent behavior streams, derived from ``seed`` when
+            omitted. Neither stream consumes the legacy environment RNG.
+        validate_order_coords:
+            Opt in to warnings about order endpoints outside ``area``.
+        statistics_granularity:
+            ``"decision"`` preserves legacy step-start lifecycle timestamps
+            and whole-step occupancy accounting. ``"continuous"`` records
+            within-step arrival timestamps and distance by actual occupancy.
+            This changes reporting only, not movement, assignment or built-in
+            rewards.
+            Service waits and completion scheduling always use precise time.
 
         Region model / single source of truth
         --------------------------------------
@@ -141,6 +173,11 @@ class RidePoolEnv:
         same regions/adjacency the env will enforce -- there is no second,
         possibly-inconsistent definition on the policy side.
         """
+        if not isinstance(statistics_granularity, str) or statistics_granularity not in (
+            "decision", "continuous"
+        ):
+            raise ValueError("statistics_granularity must be 'decision' or 'continuous'")
+        self.statistics_granularity = statistics_granularity
         self.area = area
         self.num_drivers = int(num_drivers)
         self.driver_capacity = int(driver_capacity)
@@ -213,6 +250,11 @@ class RidePoolEnv:
         self._pending_ids: List[int] = []
         self._all_orders: List[Order] = []
         self._next_inject_idx: int = 0
+        self._configure_extensions(
+            labor_source, shift_policy, initial_state, acceptance_policy,
+            acceptance_seed, response_time_policy, response_seed,
+            validate_order_coords,
+        )
 
     # ------------------------------------------------------------------ setup
     def _resolve_per_driver(self, values, default, name: str, cast):
@@ -336,7 +378,7 @@ class RidePoolEnv:
         # well-defined); on abstract networks they start at a random point in
         # the service-area bounding box.
         self.drivers = {}
-        for did in range(self.num_drivers):
+        for did in range(self.num_drivers) if self.labor_source is None else ():
             cap = self.driver_capacities[did]
             spd = self.driver_speeds[did]
             if graph_mode:
@@ -358,6 +400,8 @@ class RidePoolEnv:
                 self.drivers[did] = Driver(
                     driver_id=did, location=loc, capacity=cap, speed=spd
                 )
+        if self.labor_source is not None:
+            self.drivers = self._build_explicit_fleet()
 
         # Generate the full order set; inject those due at t == 0.
         self._all_orders = sorted(
@@ -367,6 +411,7 @@ class RidePoolEnv:
         self._pending_ids = []
         self._next_inject_idx = 0
         self._inject_due_orders()
+        self._reset_extensions()
 
         return self._build_observations(), {"time": self.time}
 
@@ -406,6 +451,8 @@ class RidePoolEnv:
         """
         if action is None:
             return [], None
+        if not self._driver_available(driver_id):
+            return [], None
 
         order_ids = list(action.get("orders", []) or [])
         relocate = action.get("relocate", None)
@@ -432,7 +479,7 @@ class RidePoolEnv:
                 raise InvalidActionError(
                     f"Driver {driver_id}: bids on unknown order {oid!r}."
                 )
-            if oid in pending_set:
+            if oid in pending_set and oid not in self._response_order_ids:
                 validated_ids.append(oid)
         order_ids = validated_ids
         # Re-evaluate whether the driver still effectively bids after filtering.
@@ -489,128 +536,67 @@ class RidePoolEnv:
                 raise ConflictError(order_id=oid, driver_ids=dids)
 
     def _assign_orders(
-        self, driver_id: int, order_ids: List[int], event: Dict
+        self, driver_id: int, order_ids: List[int], event: Dict,
+        *, _response_commit=False, _prepared_plan=None, _prepared_assignment=None,
     ) -> None:
-        """Assign a (conflict-free) bid set to a driver under the capacity rule.
+        """Prepare and commit a conflict-free assignment under the capacity rule.
 
-        Per the spec correction: if the requested set would exceed capacity, do
-        NOT raise; greedily drop the largest-party orders until it fits, so as
-        many orders as possible are still assigned. Ties broken by larger id
-        first for determinism. Dropped orders stay pending.
+        Keep the smallest parties first, breaking ties by larger order id.
+        Planning and reward baselines are prepared without changing lifecycle
+        state; a failed planner cannot leave the offered orders half assigned.
         """
         if not order_ids:
             return
 
         driver = self.drivers[driver_id]
-        baseline = driver.committed_passengers(self.orders)
-        budget = driver.capacity - baseline
-
-        # Greedy drop: sort so that we keep smallest parties first.
+        budget = driver.capacity - driver.committed_passengers(self.orders)
         candidates = sorted(
             order_ids,
             key=lambda oid: (self.orders[oid].num_passengers, -oid),
         )
-        accepted: List[int] = []
-        used = 0
+        accepted, used = [], 0
         for oid in candidates:
             party = self.orders[oid].num_passengers
             if used + party <= budget:
                 accepted.append(oid)
                 used += party
-            # else: dropped (remains pending, available next step)
+        if not accepted:
+            return
 
-        # Counterfactual baseline for already-committed orders: their estimated
-        # remaining time-to-delivery (``order.eta``) as maintained up to this
-        # step. This is the drop-off time under the route that did NOT yet
-        # include the new orders, captured incrementally (decremented each step,
-        # reset on every re-plan) so no extra route traversal is needed here.
-        # Snapshotted now, before insertion / re-planning overwrites it.
-        before_eta = {
-            oid: self.orders[oid].eta
-            for oid in driver.assigned_orders
-            if self.orders[oid].eta is not None
-        }
+        prepared = _prepared_assignment
+        if prepared is None:
+            prepared = self._prepare_assignment(driver, accepted, _prepared_plan)
+        if prepared["order_ids"] != tuple(accepted):
+            raise InvalidActionError("Prepared assignment does not match accepted orders")
+        if not _response_commit and self._behavior_enabled:
+            proceed, _ = self._consider_invitation(
+                driver, accepted, event,
+                plan=(prepared["route"], prepared["travel_times"]),
+            )
+            if not proceed:
+                return
 
+        # Everything calling user components has succeeded. Commit this batch
+        # and its event fields together; existing orders keep their lifecycle.
         for oid in accepted:
             order = self.orders[oid]
             order.status = OrderStatus.ASSIGNED
             order.assigned_driver = driver_id
             driver.assigned_orders.append(oid)
-            driver.task_points.append(
-                TaskPoint("pickup", oid, order.origin)
-            )
-            driver.task_points.append(
-                TaskPoint("dropoff", oid, order.destination)
-            )
             self._pending_ids.remove(oid)
-
             event["assigned_orders"].append(oid)
             event["assigned_party_sizes"][oid] = order.num_passengers
-            solo = self.network.shortest_path(order.origin, order.destination)
-            event["assigned_solo_times"][oid] = solo.travel_time
+            event["assigned_solo_times"][oid] = prepared["solo_times"][oid]
+            event["assigned_service_times"][oid] = prepared["service_times"][oid]
 
-        if accepted:
-            # Re-optimise the whole plan and refresh status/route. The planner
-            # reports each stop's arrival time as a by-product of the sequencing
-            # it already does, so the realised-route arrival times come for free
-            # (no second pass over the finished route).
-            driver.task_points, after_times = self.planner.plan_with_times(
-                driver.location, driver.task_points, self.network
-            )
-
-            # ----------------------------------------------------------------
-            # (1) Service-time of each NEWLY assigned order: its predicted
-            #     END-TO-END time from the user's request to the planned
-            #     drop-off, measured on the re-optimised route. Both segments
-            #     are included:
-            #       * (now - request_time): time already spent on the platform
-            #         from the moment the user sent the request to this dispatch
-            #         (request -> pending -> assignment);
-            #       * after_times[oid]["dropoff"]: planned minutes from NOW until
-            #         the order is dropped off (covers the remaining pickup wait
-            #         AND the in-vehicle ride on the pooled route).
-            #     after_times is measured from the driver's current position
-            #     (relative to the current clock T == self.time), so the
-            #     absolute predicted drop-off clock is T + after_times[...] and
-            #     the end-to-end time is that minus request_time.
-            for oid in accepted:
-                at = after_times.get(oid, {})
-                if "dropoff" in at:
-                    req = self.orders[oid].request_time
-                    end_to_end = (self.time + at["dropoff"]) - req
-                    event["assigned_service_times"][oid] = max(0.0, end_to_end)
-
-            # ----------------------------------------------------------------
-            # (2) Re-routing impact on already-committed EN-ROUTE orders: how
-            #     much each one's predicted drop-off time changes because the
-            #     new orders were inserted and the whole route re-optimised.
-            #     SIGNED (not clamped): a later drop-off is a positive penalty,
-            #     an earlier one is negative (a reward). Each en-route order is
-            #     measured separately and summed. The drop-off time already
-            #     reflects any change to that order's pickup time too (its pickup
-            #     precedes its drop-off on the same route), per design.
-            #
-            #     before_eta[oid] and after_times[oid]["dropoff"] share the same
-            #     basis (minutes-to-drop-off from the current position/clock),
-            #     so their difference is the pure re-routing delta.
-            extra_detour = 0.0
-            for oid, old_eta in before_eta.items():
-                at = after_times.get(oid, {})
-                if "dropoff" in at:
-                    extra_detour += at["dropoff"] - old_eta
-
-            event["extra_detour_time"] += extra_detour
-
-            # Refresh the maintained time-to-delivery for every order now on the
-            # driver's plan from the freshly computed arrival times (free, from
-            # the planner). These become the baseline for the next assignment.
-            for oid, at in after_times.items():
-                if "dropoff" in at:
-                    self.orders[oid].eta = at["dropoff"]
-
-            if driver.status in (DriverStatus.IDLE, DriverStatus.RELOCATING):
-                driver.relocation_target = None
-            self._refresh_driver_status(driver)
+        driver.task_points = prepared["route"]
+        event["extra_detour_time"] += prepared["extra_detour_time"]
+        for oid, arrival in prepared["arrival_times"].items():
+            if "dropoff" in arrival:
+                self.orders[oid].eta = arrival["dropoff"]
+        if driver.status in (DriverStatus.IDLE, DriverStatus.RELOCATING):
+            driver.relocation_target = None
+        self._refresh_driver_status(driver)
 
     def _set_relocation(self, driver_id: int, coord: Coord) -> None:
         driver = self.drivers[driver_id]
@@ -653,6 +639,13 @@ class RidePoolEnv:
         edge can stall a driver forever; the only precondition is a strictly
         positive budget (``speed * dt > 0``), which is asserted.
         """
+        if self._shift_enabled and not driver.on_duty and not driver.assigned_orders:
+            driver.relocation_target = None
+            self._refresh_driver_status(driver)
+            return
+        if self._timed_service(driver):
+            self._move_with_service(driver, event)
+            return
         if self._is_graph_network():
             self._move_driver_graph(driver, event)
             return
@@ -669,7 +662,10 @@ class RidePoolEnv:
                 driver.location = target
                 budget_dist -= seg.distance
                 moved += seg.distance
-                self._arrive_at_target(driver, event)
+                self._record_travel_segment(driver, event, seg.distance)
+                self._arrive_at_target(
+                    driver, event, self.time + moved / self._driver_speed(driver)
+                )
                 target = self._current_target(driver)
             else:
                 # Partial progress toward target along straight interpolation.
@@ -678,6 +674,7 @@ class RidePoolEnv:
                 tx, ty = target
                 driver.location = (ox + (tx - ox) * frac, oy + (ty - oy) * frac)
                 moved += budget_dist
+                self._record_travel_segment(driver, event, budget_dist)
                 budget_dist = 0.0
 
         event["distance_moved"] = moved
@@ -703,6 +700,20 @@ class RidePoolEnv:
             order = self.orders[oid]
             if order.eta is not None:
                 order.eta -= self.dt
+
+    def _record_travel_segment(self, driver: Driver, event: Dict, distance: float) -> None:
+        """Report distance using occupancy before this segment's next stop.
+
+        Detailed fields are opt-in. The legacy ``is_empty_move`` flag remains
+        based on step-start occupancy so reporting cannot alter rewards.
+        """
+        if self.statistics_granularity == "continuous":
+            key = (
+                "empty_distance_moved"
+                if driver.onboard_passengers == 0
+                else "occupied_distance_moved"
+            )
+            event[key] += distance
 
     # ---------------------------------------------------- graph-mode movement
     def _driver_speed(self, driver: Driver) -> float:
@@ -779,6 +790,7 @@ class RidePoolEnv:
                 # Reach the edge's end node this step.
                 budget -= remain
                 moved += remain
+                self._record_travel_segment(driver, event, remain)
                 driver.node_idx = driver.edge_to
                 driver.edge_from = driver.edge_to = None
                 driver.edge_pos_m = 0.0
@@ -786,6 +798,7 @@ class RidePoolEnv:
             else:
                 driver.edge_pos_m += budget
                 moved += budget
+                self._record_travel_segment(driver, event, budget)
                 budget = 0.0
                 driver.location = self._edge_interp_location(driver)
 
@@ -799,7 +812,7 @@ class RidePoolEnv:
             if src == dst:
                 # Already at the target node -> handle pickup/dropoff/reloc and
                 # move on to the next target.
-                self._arrive_at_target(driver, event)
+                self._arrive_at_target(driver, event, self.time + moved / speed)
                 continue
             path = net.node_path(src, dst)
             progressed = False
@@ -809,11 +822,12 @@ class RidePoolEnv:
                 if budget + eps >= edge_len:
                     budget -= edge_len
                     moved += edge_len
+                    self._record_travel_segment(driver, event, edge_len)
                     driver.node_idx = v
                     driver.location = net.node_coord(v)
                     progressed = True
                     if v == dst:
-                        self._arrive_at_target(driver, event)
+                        self._arrive_at_target(driver, event, self.time + moved / speed)
                         break
                 else:
                     # Enter edge u->v and stop part-way (budget is strictly
@@ -823,6 +837,7 @@ class RidePoolEnv:
                     driver.edge_pos_m = budget
                     driver.node_idx = None
                     moved += budget
+                    self._record_travel_segment(driver, event, budget)
                     budget = 0.0
                     driver.location = self._edge_interp_location(driver)
                     progressed = True
@@ -856,19 +871,26 @@ class RidePoolEnv:
             return driver.relocation_target
         return None
 
-    def _arrive_at_target(self, driver: Driver, event: Dict) -> None:
+    def _arrive_at_target(
+        self, driver: Driver, event: Dict, arrival_time: Optional[float] = None
+    ) -> None:
         """Handle arrival at the current target (task point or relocation)."""
+        recorded_time = (
+            arrival_time
+            if self.statistics_granularity == "continuous" and arrival_time is not None
+            else self.time
+        )
         if driver.task_points:
             tp = driver.task_points.pop(0)
             order = self.orders[tp.order_id]
             if tp.kind == "pickup":
                 order.status = OrderStatus.ONBOARD
-                order.pickup_time = self.time
+                order.pickup_time = recorded_time
                 driver.onboard_passengers += order.num_passengers
                 event["picked_up_orders"].append(order.order_id)
             else:  # dropoff
                 order.status = OrderStatus.COMPLETED
-                order.dropoff_time = self.time
+                order.dropoff_time = recorded_time
                 order.eta = None  # delivered: no remaining time-to-delivery
                 driver.onboard_passengers -= order.num_passengers
                 if order.order_id in driver.assigned_orders:
@@ -910,7 +932,7 @@ class RidePoolEnv:
                 "num_passengers": o.num_passengers,
                 "waiting_time": o.waiting_time(self.time),
             }
-            for oid in self._pending_ids
+            for oid in self._pending_ids if oid not in self._response_order_ids
             for o in (self.orders[oid],)
         ]
 
@@ -972,10 +994,11 @@ class RidePoolEnv:
                 # which regions a driver may relocate to from its current one.
                 "region_neighbours": self.region_neighbours,
             }
+        self._extend_observations(obs, all_drivers)
         return obs
 
     def _new_event(self) -> Dict:
-        return {
+        event = {
             "assigned_orders": [],
             # Per newly-assigned order: its passenger (party) count. Used by the
             # reward's revenue bonus, which scales fare by the number of riders.
@@ -996,6 +1019,9 @@ class RidePoolEnv:
             "is_idle_wait": False,
             "extra_detour_time": 0.0,
         }
+        if self.statistics_granularity == "continuous":
+            event.update(empty_distance_moved=0.0, occupied_distance_moved=0.0)
+        return event
 
     # -------------------------------------------------------------------- step
     def step(self, actions: Dict[int, Dict]):
@@ -1006,6 +1032,7 @@ class RidePoolEnv:
         """
         actions = actions or {}
         events = {did: self._new_event() for did in self.drivers}
+        self._update_shifts()
 
         # --- Step 1: cancel timed-out pending orders BEFORE anything else. ---
         self._cancel_timed_out()
@@ -1034,6 +1061,8 @@ class RidePoolEnv:
         # --- Step 6: advance clock, inject new orders. ---
         self.time += self.dt
         self._inject_due_orders()
+        self._settle_responses(events)
+        self._update_shifts()
 
         # --- Step 7: rewards. ---
         rewards = {

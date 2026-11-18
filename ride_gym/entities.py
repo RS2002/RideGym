@@ -9,7 +9,10 @@ accidentally corrupt internal state.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from ride_gym.labor_source import ShiftWindow
 
 from ride_gym.enums import DriverStatus, OrderStatus
 
@@ -59,6 +62,10 @@ class Order:
     # attribute pooling detour to a newly accepted order (how much later it
     # pushes already-committed deliveries) without re-walking the prior route.
     eta: Optional[float] = None
+
+    # Optional earliest pickup time, in simulation minutes. Appended after all
+    # original fields so existing positional constructors retain their meaning.
+    ready_time: Optional[float] = None
 
     def waiting_time(self, now: float) -> float:
         """How long the order has waited in the pending pool so far."""
@@ -148,6 +155,23 @@ class Driver:
     edge_from: Optional[int] = None
     edge_to: Optional[int] = None
     edge_pos_m: float = 0.0
+
+    # Optional fleet/availability features. These are intentionally appended;
+    # neither the original status enum nor positional constructors are changed.
+    on_duty: bool = True
+    shift_start: Optional[float] = None
+    shift_end: Optional[float] = None
+    departed: bool = False
+    waiting_until_ready: Optional[float] = None
+    vehicle_type: Optional[str] = None
+    pickup_service_time: float = 0.0
+    dropoff_service_time: float = 0.0
+    availability_windows: Tuple["ShiftWindow", ...] = ()
+    active_shift_window: Optional[int] = None
+    service_until: Optional[float] = None
+    service_order_id: Optional[int] = None
+    service_kind: Optional[str] = None
+    awaiting_response: bool = False
 
     # ----- capacity accounting -------------------------------------------
     def committed_passengers(self, orders_by_id) -> int:

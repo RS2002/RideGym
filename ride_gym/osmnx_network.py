@@ -79,6 +79,11 @@ class OSMnxNetwork(RoadNetwork):
     matrix_cache_path:
         Explicit path for the matrix cache. ``None`` (default) derives it from
         ``graph_path`` by appending ``.matrices.npz``.
+    max_matrix_bytes:
+        Optional byte limit for the dense float64 distance and int32 predecessor
+        arrays. Checked before allocating or loading them. ``None`` preserves
+        the original unrestricted behavior. The graph and temporary build
+        allocations are not included in this estimate.
     """
 
     def __init__(
@@ -88,6 +93,8 @@ class OSMnxNetwork(RoadNetwork):
         snap_cache: bool = True,
         cache_matrices: bool = True,
         matrix_cache_path: Optional[str] = None,
+        *,
+        max_matrix_bytes: Optional[int] = None,
     ):
         with open(graph_path, "rb") as f:
             g: nx.MultiDiGraph = pickle.load(f)
@@ -107,6 +114,9 @@ class OSMnxNetwork(RoadNetwork):
         }
         n = len(self._node_ids)
         self._n = n
+        if max_matrix_bytes is not None:
+            from ride_gym.region import NodeBudget
+            NodeBudget(max_matrix_bytes).check(n, what="Road network")
 
         # Node coordinates as an [N, 2] array of (lon, lat) for vectorised snap.
         self._coords = np.array(

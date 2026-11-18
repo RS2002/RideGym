@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ride-gym"
+dynamic = ["version"]
+description = "A multi-agent ride-pooling and dispatch simulation environment"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.20"]
+
+[project.optional-dependencies]
+osmnx = ["networkx", "osmnx"]
+data = ["pandas", "pyarrow", "geopandas", "osmnx"]
+viz = ["matplotlib", "pillow", "imageio"]
+all = ["networkx", "osmnx", "pandas", "pyarrow", "geopandas", "matplotlib", "pillow", "imageio"]
+
+[tool.setuptools.dynamic]
+version = {attr = "ride_gym.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["ride_gym", "ride_gym.*"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

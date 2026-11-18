@@ -29,7 +29,8 @@ class RewardFunction(ABC):
 
         * ``assigned_orders``      : list of order ids newly assigned this step.
         * ``assigned_solo_times``  : dict order_id -> solo service time (min),
-                                     i.e. direct pickup->dropoff travel time.
+                                     i.e. direct pickup->dropoff travel time
+                                     at the assigned vehicle's effective speed.
         * ``assigned_party_sizes`` : dict order_id -> passenger (party) count
                                      of each newly assigned order.
         * ``assigned_service_times`` : dict order_id -> predicted END-TO-END
@@ -42,7 +43,11 @@ class RewardFunction(ABC):
         * ``picked_up_orders``     : list of order ids picked up this step.
         * ``distance_moved``       : coordinate units travelled this step.
         * ``time_moved``           : minutes spent moving this step.
-        * ``is_empty_move``        : bool, moved with zero onboard passengers.
+        * ``is_empty_move``        : bool, started the step empty and moved;
+                                     preserved in both reporting modes.
+        * ``empty_distance_moved`` / ``occupied_distance_moved``: optional
+                                     segment-level distances in continuous
+                                     reporting mode; not used by this reward.
         * ``is_idle_wait``         : bool, stayed put with no tasks.
         * ``extra_detour_time``    : SIGNED minutes of re-routing impact on the
                                      driver's already-committed en-route orders
